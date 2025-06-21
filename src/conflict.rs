@@ -79,7 +79,7 @@ impl ConflictResolver {
             if self.is_rebase_actually_active()? {
                 return Ok(GitState::Rebasing);
             } else {
-                // Clean up stale rebase files
+                // Clean up stale rebase state using safe git command
                 ui::print_info("Detected stale rebase state files, cleaning up...");
                 self.cleanup_stale_rebase_files()?;
             }
@@ -91,6 +91,7 @@ impl ConflictResolver {
                 return Ok(GitState::Merging);
             } else {
                 ui::print_info("Detected stale merge state files, cleaning up...");
+                // Clean up stale merge state using safe git command
                 self.cleanup_stale_merge_files()?;
             }
         }
@@ -101,6 +102,7 @@ impl ConflictResolver {
                 return Ok(GitState::CherryPicking);
             } else {
                 ui::print_info("Detected stale cherry-pick state files, cleaning up...");
+                // Clean up stale cherry-pick state using safe git command
                 self.cleanup_stale_cherry_pick_files()?;
             }
         }
@@ -140,76 +142,39 @@ impl ConflictResolver {
         }
     }
 
-    /// Clean up stale rebase files
+    /// Clean up stale rebase state using `git rebase --abort`
     fn cleanup_stale_rebase_files(&self) -> Result<()> {
-        let git_dir = &self.git_dir;
-        let files_to_remove = [
-            "REBASE_HEAD",
-            "ORIG_HEAD", // Only if it's from a rebase
-        ];
-
-        for file in &files_to_remove {
-            let file_path = git_dir.join(file);
-            if file_path.exists() {
-                if let Err(e) = std::fs::remove_file(&file_path) {
-                    ui::print_warning(&format!("Could not remove stale file {}: {}", file, e));
-                } else {
-                    ui::print_info(&format!("Removed stale file: {}", file));
-                }
-            }
+        match self.git_repo.run(&["rebase", "--abort"]) {
+            Ok(_) => ui::print_info("Ran 'git rebase --abort' to clean stale state"),
+            Err(e) => ui::print_warning(&format!(
+                "Could not run 'git rebase --abort': {} (state may already be clean)",
+                e
+            )),
         }
-
-        // Remove any stale rebase directories
-        let rebase_dirs = ["rebase-merge", "rebase-apply"];
-        for dir in &rebase_dirs {
-            let dir_path = git_dir.join(dir);
-            if dir_path.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&dir_path) {
-                    ui::print_warning(&format!("Could not remove stale directory {}: {}", dir, e));
-                } else {
-                    ui::print_info(&format!("Removed stale directory: {}", dir));
-                }
-            }
-        }
-
         Ok(())
     }
 
     /// Clean up stale merge files
     fn cleanup_stale_merge_files(&self) -> Result<()> {
-        let git_dir = &self.git_dir;
-        let files_to_remove = ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE"];
-
-        for file in &files_to_remove {
-            let file_path = git_dir.join(file);
-            if file_path.exists() {
-                if let Err(e) = std::fs::remove_file(&file_path) {
-                    ui::print_warning(&format!("Could not remove stale file {}: {}", file, e));
-                } else {
-                    ui::print_info(&format!("Removed stale file: {}", file));
-                }
-            }
+        match self.git_repo.run(&["merge", "--abort"]) {
+            Ok(_) => ui::print_info("Ran 'git merge --abort' to clean stale state"),
+            Err(e) => ui::print_warning(&format!(
+                "Could not run 'git merge --abort': {} (state may already be clean)",
+                e
+            )),
         }
-
         Ok(())
     }
 
     /// Clean up stale cherry-pick files
     fn cleanup_stale_cherry_pick_files(&self) -> Result<()> {
-        let git_dir = &self.git_dir;
-        let files_to_remove = ["CHERRY_PICK_HEAD", "CHERRY_PICK_MSG"];
-
-        for file in &files_to_remove {
-            let file_path = git_dir.join(file);
-            if file_path.exists() {
-                if let Err(e) = std::fs::remove_file(&file_path) {
-                    ui::print_warning(&format!("Could not remove stale file {}: {}", file, e));
-                } else {
-                    ui::print_info(&format!("Removed stale file: {}", file));
-                }
-            }
+        match self.git_repo.run(&["cherry-pick", "--abort"]) {
+            Ok(_) => ui::print_info("Ran 'git cherry-pick --abort' to clean stale state"),
+            Err(e) => ui::print_warning(&format!(
+                "Could not run 'git cherry-pick --abort': {} (state may already be clean)",
+                e
+            )),
         }
-
         Ok(())
     }
 
@@ -340,11 +305,11 @@ impl ConflictResolver {
         std::io::stdin().read_line(&mut input)?;
 
         // Verify conflicts are resolved
-        self.verify_conflicts_resolved().await
+        self.verify_conflicts_resolved(conflict_info).await
     }
 
     /// Verify that all conflicts have been resolved
-    pub async fn verify_conflicts_resolved(&self) -> Result<()> {
+    pub async fn verify_conflicts_resolved(&self, original: &ConflictInfo) -> Result<()> {
         let current_conflicts = self.detect_conflicts()?;
 
         if let Some(conflicts) = current_conflicts {
@@ -363,8 +328,10 @@ impl ConflictResolver {
             }
         }
 
-        // Add resolved files and continue
-        self.git_repo.run(&["add", "."])?;
+        // Add only the files that were conflicted
+        for f in &original.files {
+            self.git_repo.run(&["add", &f.path])?;
+        }
 
         match self.get_git_state()? {
             GitState::Rebasing => {
@@ -463,6 +430,79 @@ impl ConflictResolver {
                 ui::print_warning("No operation to abort");
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn init_repo() -> Result<(tempfile::TempDir, GitRepository, PathBuf)> {
+        let tmp = tempfile::tempdir()?;
+        Command::new("git").arg("init").current_dir(tmp.path()).output()?;
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(tmp.path())
+            .output()?;
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(tmp.path())
+            .output()?;
+        let repo = GitRepository::new(tmp.path())?;
+        let git_dir = tmp.path().join(".git");
+        Ok((tmp, repo, git_dir))
+    }
+
+    #[test]
+    fn cleanup_rebase_preserves_orig_head() -> Result<()> {
+        let (_tmp, repo, git_dir) = init_repo()?;
+        std::fs::write(git_dir.join("ORIG_HEAD"), "dummy")?;
+        let resolver = ConflictResolver::new(TrainConfig::default(), git_dir.clone(), repo);
+
+        resolver.cleanup_stale_rebase_files()?;
+
+        assert!(git_dir.join("ORIG_HEAD").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verify_conflicts_adds_only_specified_files() -> Result<()> {
+        let (_tmp, repo, git_dir) = init_repo()?;
+
+        std::fs::write(git_dir.parent().unwrap().join("file1.txt"), "a")?;
+        std::fs::write(git_dir.parent().unwrap().join("other.txt"), "b")?;
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(git_dir.parent().unwrap())
+            .output()?;
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(git_dir.parent().unwrap())
+            .output()?;
+
+        // Modify both files
+        std::fs::write(git_dir.parent().unwrap().join("file1.txt"), "changed")?;
+        std::fs::write(git_dir.parent().unwrap().join("other.txt"), "changed2")?;
+
+        let resolver = ConflictResolver::new(TrainConfig::default(), git_dir.clone(), repo);
+        let info = ConflictInfo {
+            files: vec![ConflictFile {
+                path: "file1.txt".to_string(),
+                status: ConflictStatus::BothModified,
+            }],
+        };
+
+        resolver.verify_conflicts_resolved(&info).await?;
+
+        let out = Command::new("git")
+            .args(["diff", "--name-only", "--cached"])
+            .current_dir(git_dir.parent().unwrap())
+            .output()?;
+        let staged = String::from_utf8(out.stdout)?;
+        assert_eq!(staged.trim(), "file1.txt");
+
         Ok(())
     }
 }

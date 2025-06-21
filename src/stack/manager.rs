@@ -1107,7 +1107,10 @@ impl StackManager {
                                 .auto_resolve_conflicts(&conflicts)
                                 .await?
                             {
-                                self.conflict_resolver.verify_conflicts_resolved().await?;
+                                self
+                                    .conflict_resolver
+                                    .verify_conflicts_resolved(&conflicts)
+                                    .await?;
                                 print_success(
                                     "Automatically resolved conflicts and completed operation",
                                 );
