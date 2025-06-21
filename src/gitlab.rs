@@ -2,6 +2,7 @@ use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use crate::errors::TrainError;
+use crate::utils::run_git_command;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MergeRequest {
@@ -15,6 +16,26 @@ pub struct MergeRequest {
     pub web_url: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GitLabProject {
+    pub id: u64,
+    pub name: String,
+    pub path: String,
+    pub namespace: GitLabNamespace,
+    pub description: Option<String>,
+    pub web_url: String,
+    pub ssh_url_to_repo: String,
+    pub http_url_to_repo: String,
+    pub default_branch: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GitLabNamespace {
+    pub id: u64,
+    pub name: String,
+    pub path: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CreateMergeRequestRequest {
     pub source_branch: String,
@@ -23,11 +44,19 @@ pub struct CreateMergeRequestRequest {
     pub description: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProjectInfo {
+    pub host: String,
+    pub namespace: String,
+    pub project: String,
+}
+
 pub struct GitLabClient {
     client: Client,
     base_url: String,
     token: String,
-    project_id: String,
+    project_info: Option<ProjectInfo>,
+    project_details: Option<GitLabProject>,
 }
 
 impl GitLabClient {
@@ -39,11 +68,6 @@ impl GitLabClient {
             
         let base_url = std::env::var("GITLAB_URL")
             .unwrap_or_else(|_| "https://gitlab.com".to_string());
-            
-        let project_id = std::env::var("GITLAB_PROJECT_ID")
-            .map_err(|_| TrainError::SecurityError {
-                message: "GITLAB_PROJECT_ID environment variable not set".to_string(),
-            })?;
 
         let client = Client::new();
 
@@ -51,12 +75,187 @@ impl GitLabClient {
             client,
             base_url,
             token,
-            project_id,
+            project_info: None,
+            project_details: None,
         })
     }
 
+    pub async fn detect_and_cache_project(&mut self) -> Result<&GitLabProject> {
+        // Return cached project if already available
+        if let Some(ref project) = self.project_details {
+            return Ok(project);
+        }
+
+        // Try to auto-detect project from git remotes
+        match self.detect_project_from_remotes().await {
+            Ok((info, details)) => {
+                self.project_info = Some(info);
+                self.project_details = Some(details);
+                Ok(self.project_details.as_ref().unwrap())
+            }
+            Err(_) => {
+                // Fall back to environment variables if available
+                if let Ok(project_id) = std::env::var("GITLAB_PROJECT_ID") {
+                    if let Ok(project_details) = Self::get_project_by_id(&self.base_url, &self.token, &self.client, &project_id).await {
+                        self.project_details = Some(project_details);
+                        return Ok(self.project_details.as_ref().unwrap());
+                    }
+                }
+                
+                Err(TrainError::GitLabError {
+                    message: "Could not detect GitLab project from git remotes or GITLAB_PROJECT_ID".to_string(),
+                }.into())
+            }
+        }
+    }
+
+    async fn detect_project_from_remotes(&self) -> Result<(ProjectInfo, GitLabProject)> {
+        // Get all git remotes
+        let remotes_output = run_git_command(&["remote", "-v"])?;
+        
+        for line in remotes_output.lines() {
+            if let Some(project_info) = Self::parse_gitlab_remote(line)? {
+                // Verify this matches our GitLab instance
+                if project_info.host == self.base_url.replace("https://", "").replace("http://", "") 
+                   || (self.base_url.contains("gitlab.com") && project_info.host == "gitlab.com") {
+                    
+                    // Fetch project details from GitLab API
+                    let project_path = format!("{}/{}", project_info.namespace, project_info.project);
+                    if let Ok(project_details) = Self::get_project_by_path(&self.base_url, &self.token, &self.client, &project_path).await {
+                        return Ok((project_info, project_details));
+                    }
+                }
+            }
+        }
+
+        Err(TrainError::GitLabError {
+            message: "Could not detect GitLab project from git remotes".to_string(),
+        }.into())
+    }
+
+    fn parse_gitlab_remote(remote_line: &str) -> Result<Option<ProjectInfo>> {
+        // Parse lines like:
+        // origin  git@gitlab.com:namespace/project.git (fetch)
+        // origin  https://gitlab.com/namespace/project.git (push)
+        
+        let parts: Vec<&str> = remote_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            return Ok(None);
+        }
+
+        let url = parts[1];
+        
+        // Handle SSH URLs (git@host:namespace/project.git)
+        if url.starts_with("git@") {
+            if let Some(colon_pos) = url.find(':') {
+                let host = &url[4..colon_pos]; // Skip "git@"
+                let path = &url[colon_pos + 1..];
+                let path = path.strip_suffix(".git").unwrap_or(path);
+                
+                if let Some(slash_pos) = path.find('/') {
+                    let namespace = &path[..slash_pos];
+                    let project = &path[slash_pos + 1..];
+                    
+                    return Ok(Some(ProjectInfo {
+                        host: host.to_string(),
+                        namespace: namespace.to_string(),
+                        project: project.to_string(),
+                    }));
+                }
+            }
+        }
+        
+        // Handle HTTPS URLs (https://host/namespace/project.git)
+        if url.starts_with("http") {
+            if let Ok(parsed_url) = url::Url::parse(url) {
+                if let Some(host) = parsed_url.host_str() {
+                    let path = parsed_url.path();
+                    let path = path.strip_prefix('/').unwrap_or(path);
+                    let path = path.strip_suffix(".git").unwrap_or(path);
+                    
+                    if let Some(slash_pos) = path.find('/') {
+                        let namespace = &path[..slash_pos];
+                        let project = &path[slash_pos + 1..];
+                        
+                        return Ok(Some(ProjectInfo {
+                            host: host.to_string(),
+                            namespace: namespace.to_string(),
+                            project: project.to_string(),
+                        }));
+                    }
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+
+    async fn get_project_by_path(base_url: &str, token: &str, client: &Client, project_path: &str) -> Result<GitLabProject> {
+        // URL encode the project path for the API
+        let encoded_path = urlencoding::encode(project_path);
+        let url = format!("{}/api/v4/projects/{}", base_url, encoded_path);
+        
+        let response = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let project: GitLabProject = response.json().await?;
+            Ok(project)
+        } else {
+            let error_text = response.text().await?;
+            Err(TrainError::GitLabError {
+                message: format!("Failed to get project by path {}: {}", project_path, error_text),
+            }.into())
+        }
+    }
+
+    async fn get_project_by_id(base_url: &str, token: &str, client: &Client, project_id: &str) -> Result<GitLabProject> {
+        let url = format!("{}/api/v4/projects/{}", base_url, project_id);
+        
+        let response = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let project: GitLabProject = response.json().await?;
+            Ok(project)
+        } else {
+            let error_text = response.text().await?;
+            Err(TrainError::GitLabError {
+                message: format!("Failed to get project by ID {}: {}", project_id, error_text),
+            }.into())
+        }
+    }
+
+    pub fn get_project_details(&self) -> Option<&GitLabProject> {
+        self.project_details.as_ref()
+    }
+
+    pub fn get_project_id(&self) -> Option<String> {
+        self.project_details.as_ref().map(|p| p.id.to_string())
+    }
+
+    fn get_project_id_for_api(&self) -> Result<String> {
+        // Try project details first, then fall back to environment variable
+        if let Some(project) = &self.project_details {
+            Ok(project.id.to_string())
+        } else if let Ok(project_id) = std::env::var("GITLAB_PROJECT_ID") {
+            Ok(project_id)
+        } else {
+            Err(TrainError::GitLabError {
+                message: "No GitLab project ID available. Either auto-detection failed or GITLAB_PROJECT_ID is not set".to_string(),
+            }.into())
+        }
+    }
+
     pub async fn create_merge_request(&self, request: CreateMergeRequestRequest) -> Result<MergeRequest> {
-        let url = format!("{}/api/v4/projects/{}/merge_requests", self.base_url, self.project_id);
+        let project_id = self.get_project_id_for_api()?;
+        let url = format!("{}/api/v4/projects/{}/merge_requests", self.base_url, project_id);
         
         let response = self.client
             .post(&url)
@@ -77,7 +276,8 @@ impl GitLabClient {
     }
 
     pub async fn get_merge_requests(&self) -> Result<Vec<MergeRequest>> {
-        let url = format!("{}/api/v4/projects/{}/merge_requests", self.base_url, self.project_id);
+        let project_id = self.get_project_id_for_api()?;
+        let url = format!("{}/api/v4/projects/{}/merge_requests", self.base_url, project_id);
         
         let response = self.client
             .get(&url)
@@ -98,7 +298,8 @@ impl GitLabClient {
     }
 
     pub async fn update_merge_request(&self, iid: u64, title: Option<String>, description: Option<String>) -> Result<MergeRequest> {
-        let url = format!("{}/api/v4/projects/{}/merge_requests/{}", self.base_url, self.project_id, iid);
+        let project_id = self.get_project_id_for_api()?;
+        let url = format!("{}/api/v4/projects/{}/merge_requests/{}", self.base_url, project_id, iid);
         
         let mut params = serde_json::Map::new();
         if let Some(title) = title {

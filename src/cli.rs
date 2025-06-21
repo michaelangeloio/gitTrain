@@ -52,6 +52,15 @@ pub enum Commands {
         stack: String,
     },
 
+    /// Delete a stack
+    Delete {
+        /// Stack name or ID
+        stack: String,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        force: bool,
+    },
+
     /// Push stack to remote
     Push,
 

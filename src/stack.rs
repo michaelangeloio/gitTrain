@@ -12,7 +12,7 @@ use crate::utils::{
     print_train_header, sanitize_branch_name, confirm_action, get_user_input,
     create_backup_name
 };
-use crate::gitlab::{GitLabClient, CreateMergeRequestRequest};
+use crate::gitlab::{GitLabClient, CreateMergeRequestRequest, GitLabProject};
 use crate::errors::TrainError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +33,7 @@ pub struct Stack {
     pub base_branch: String,
     pub branches: HashMap<String, StackBranch>,
     pub current_branch: Option<String>,
+    pub gitlab_project: Option<GitLabProject>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -101,6 +102,25 @@ impl StackManager {
         let sanitized_name = sanitize_branch_name(name);
         let stack_id = Uuid::new_v4().to_string();
 
+        // Get GitLab project information if available
+        let gitlab_project = if let Some(gitlab_client) = &mut self.gitlab_client {
+            print_info("Detecting GitLab project...");
+            match gitlab_client.detect_and_cache_project().await {
+                Ok(project) => {
+                    print_success(&format!("Detected GitLab project: {}/{}", 
+                        project.namespace.path, project.path));
+                    print_info(&format!("Project URL: {}", project.web_url));
+                    Some(project.clone())
+                }
+                Err(e) => {
+                    print_warning(&format!("GitLab project could not be auto-detected: {}", e));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Create the stack structure
         let mut stack = Stack {
             id: stack_id.clone(),
@@ -108,6 +128,7 @@ impl StackManager {
             base_branch: base_branch.clone(),
             branches: HashMap::new(),
             current_branch: Some(current_branch.clone()),
+            gitlab_project,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -329,11 +350,18 @@ impl StackManager {
             if let Ok(stack_json) = std::fs::read_to_string(&stack_file) {
                 if let Ok(stack) = serde_json::from_str::<Stack>(&stack_json) {
                     let is_current = if current_stack_id == stack.id { " (current)" } else { "" };
+                    let project_info = if let Some(project) = &stack.gitlab_project {
+                        format!(" | Project: {}/{}", project.namespace.path, project.path)
+                    } else {
+                        String::new()
+                    };
+                    
                     println!("📋 {} ({}){}", stack.name, &stack.id[..8], is_current);
-                    println!("   └─ Base: {} | Branches: {} | Updated: {}", 
+                    println!("   └─ Base: {} | Branches: {} | Updated: {}{}", 
                         stack.base_branch, 
                         stack.branches.len(),
-                        stack.updated_at.format("%Y-%m-%d %H:%M")
+                        stack.updated_at.format("%Y-%m-%d %H:%M"),
+                        project_info
                     );
                 }
             }
@@ -391,6 +419,94 @@ impl StackManager {
         Ok(())
     }
 
+    pub async fn delete_stack(&mut self, stack_identifier: &str, force: bool) -> Result<()> {
+        print_train_header(&format!("Deleting Stack: {}", stack_identifier));
+
+        // Find the stack by name or ID
+        let stack_files = std::fs::read_dir(&self.train_dir)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                if path.extension()? == "json" && path.file_name()? != "current.json" {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut target_stack: Option<(Stack, PathBuf)> = None;
+
+        for stack_file in stack_files {
+            if let Ok(stack_json) = std::fs::read_to_string(&stack_file) {
+                if let Ok(stack) = serde_json::from_str::<Stack>(&stack_json) {
+                    if stack.name == stack_identifier || stack.id.starts_with(stack_identifier) {
+                        target_stack = Some((stack, stack_file));
+                        break;
+                    }
+                }
+            }
+        }
+
+        let (stack, stack_file) = target_stack.ok_or_else(|| {
+            TrainError::StackError {
+                message: format!("Stack '{}' not found", stack_identifier),
+            }
+        })?;
+
+        // Check if this is the current stack
+        let current_file = self.train_dir.join("current.json");
+        let is_current_stack = if let Ok(current_stack_id) = std::fs::read_to_string(&current_file) {
+            current_stack_id.trim() == stack.id
+        } else {
+            false
+        };
+
+        // Show what will be deleted
+        print_warning(&format!("This will permanently delete stack '{}' ({})", stack.name, &stack.id[..8]));
+        print_info(&format!("Stack contains {} branches:", stack.branches.len()));
+        for branch_name in stack.branches.keys() {
+            println!("  - {}", branch_name);
+        }
+
+        if let Some(project) = &stack.gitlab_project {
+            print_info(&format!("Associated with GitLab project: {}/{}", 
+                project.namespace.path, project.path));
+        }
+
+        if is_current_stack {
+            print_warning("This is the current active stack");
+        }
+
+        // Confirm deletion unless forced
+        if !force {
+            print_warning("Are you sure you want to delete this stack? This action cannot be undone.");
+            let confirmed = get_user_input("Type 'yes' to confirm deletion", None)?;
+            if confirmed.to_lowercase() != "yes" {
+                print_info("Stack deletion cancelled");
+                return Ok(());
+            }
+        }
+
+        // Delete the stack file
+        std::fs::remove_file(&stack_file)?;
+        print_success(&format!("Deleted stack file: {:?}", stack_file));
+
+        // If this was the current stack, clear the current stack reference
+        if is_current_stack {
+            if current_file.exists() {
+                std::fs::remove_file(&current_file)?;
+            }
+            self.current_stack = None;
+            print_info("Cleared current stack reference");
+        }
+
+        print_success(&format!("Stack '{}' has been deleted", stack.name));
+        print_info("Note: Git branches were not deleted. You may want to clean them up manually if needed.");
+
+        Ok(())
+    }
+
     pub async fn show_status(&mut self) -> Result<()> {
         print_train_header("Stack Status");
 
@@ -413,6 +529,13 @@ impl StackManager {
 
         println!("Stack: {} ({})", stack.name, &stack.id[..8]);
         println!("Base branch: {}", stack.base_branch);
+        
+        if let Some(project) = &stack.gitlab_project {
+            println!("GitLab project: {}/{} (ID: {})", 
+                project.namespace.path, project.path, project.id);
+            println!("Project URL: {}", project.web_url);
+        }
+        
         println!("Created: {}", stack.created_at.format("%Y-%m-%d %H:%M:%S UTC"));
         println!("Updated: {}", stack.updated_at.format("%Y-%m-%d %H:%M:%S UTC"));
         println!();
@@ -434,7 +557,7 @@ impl StackManager {
     pub async fn push_stack(&mut self) -> Result<()> {
         print_train_header("Pushing Stack");
 
-        let stack = self.get_current_stack()?;
+        let stack = self.load_current_stack()?;
 
         // Push all branches in the stack
         for (branch_name, branch) in &stack.branches {
@@ -449,10 +572,20 @@ impl StackManager {
             }
 
                     // Create or update merge request if GitLab client is available
-        if let Some(gitlab_client) = &self.gitlab_client {
-            match self.create_or_update_mr(gitlab_client, branch_name, branch, &stack).await {
-                Ok(_) => print_success(&format!("Updated merge request for {}", branch_name)),
-                Err(e) => print_warning(&format!("Failed to update MR for {}: {}", branch_name, e)),
+        if self.gitlab_client.is_some() {
+            // Ensure project is detected and cached
+            if let Some(gitlab_client) = &mut self.gitlab_client {
+                if gitlab_client.get_project_details().is_none() {
+                    let _ = gitlab_client.detect_and_cache_project().await;
+                }
+            }
+            
+            // Now use immutable reference for API calls
+            if let Some(gitlab_client) = &self.gitlab_client {
+                match self.create_or_update_mr(gitlab_client, branch_name, branch, &stack).await {
+                    Ok(_) => print_success(&format!("Updated merge request for {}", branch_name)),
+                    Err(e) => print_warning(&format!("Failed to update MR for {}: {}", branch_name, e)),
+                }
             }
         }
         }
@@ -465,7 +598,7 @@ impl StackManager {
     pub async fn sync_with_remote(&mut self) -> Result<()> {
         print_train_header("Syncing with Remote");
 
-        let stack = self.get_current_stack()?;
+        let stack = self.load_current_stack()?;
         let current_branch = self.get_current_branch()?;
 
         // Ensure working directory is clean
