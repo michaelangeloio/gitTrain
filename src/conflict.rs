@@ -4,8 +4,9 @@ use std::process::Command;
 
 use crate::config::TrainConfig;
 use crate::errors::TrainError;
+use crate::git::GitRepository;
 use crate::utils::{
-    confirm_action, print_error, print_info, print_success, print_warning, run_git_command,
+    confirm_action, print_error, print_info, print_success, print_warning,
 };
 
 #[derive(Debug, Clone)]
@@ -40,11 +41,16 @@ pub enum GitState {
 pub struct ConflictResolver {
     config: TrainConfig,
     git_dir: PathBuf,
+    git_repo: GitRepository,
 }
 
 impl ConflictResolver {
-    pub fn new(config: TrainConfig, git_dir: PathBuf) -> Self {
-        Self { config, git_dir }
+    pub fn new(config: TrainConfig, git_dir: PathBuf, git_repo: GitRepository) -> Self {
+        Self {
+            config,
+            git_dir,
+            git_repo,
+        }
     }
 
     /// Check the current git state for conflicts
@@ -52,7 +58,7 @@ impl ConflictResolver {
         let git_dir = &self.git_dir;
 
         // First check what git actually thinks about the repository state
-        let status_output = run_git_command(&["status", "--porcelain=v1"])?;
+        let status_output = self.git_repo.run(&["status", "--porcelain=v1"])?;
         let status_lines: Vec<&str> = status_output.lines().collect();
 
         // Check for actual conflicts in working directory first
@@ -107,7 +113,7 @@ impl ConflictResolver {
     /// Check if a rebase is actually in progress (not just stale files)
     fn is_rebase_actually_active(&self) -> Result<bool> {
         // Try to get rebase info - this will fail if no rebase is actually in progress
-        match run_git_command(&["rebase", "--show-current-patch"]) {
+        match self.git_repo.run(&["rebase", "--show-current-patch"]) {
             Ok(_) => Ok(true),
             Err(_) => {
                 // Also check for rebase directories that would exist during an active rebase
@@ -127,7 +133,7 @@ impl ConflictResolver {
     /// Check if a cherry-pick is actually in progress
     fn is_cherry_pick_actually_active(&self) -> Result<bool> {
         // Try to continue cherry-pick to see if it's actually in progress
-        match run_git_command(&["cherry-pick", "--continue", "--dry-run"]) {
+        match self.git_repo.run(&["cherry-pick", "--continue", "--dry-run"]) {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
         }
@@ -359,19 +365,19 @@ impl ConflictResolver {
         }
 
         // Add resolved files and continue
-        run_git_command(&["add", "."])?;
+        self.git_repo.run(&["add", "."])?;
 
         match self.get_git_state()? {
             GitState::Rebasing => {
-                run_git_command(&["rebase", "--continue"])?;
+                self.git_repo.run(&["rebase", "--continue"])?;
                 print_success("Rebase continued successfully");
             }
             GitState::Merging => {
-                run_git_command(&["commit", "--no-edit"])?;
+                self.git_repo.run(&["commit", "--no-edit"])?;
                 print_success("Merge completed successfully");
             }
             GitState::CherryPicking => {
-                run_git_command(&["cherry-pick", "--continue"])?;
+                self.git_repo.run(&["cherry-pick", "--continue"])?;
                 print_success("Cherry-pick continued successfully");
             }
             _ => {
@@ -383,7 +389,7 @@ impl ConflictResolver {
     }
 
     fn analyze_conflicts(&self) -> Result<Option<ConflictInfo>> {
-        let status_output = run_git_command(&["status", "--porcelain"])?;
+        let status_output = self.git_repo.run(&["status", "--porcelain"])?;
         let mut conflict_files = Vec::new();
 
         for line in status_output.lines() {
@@ -440,15 +446,15 @@ impl ConflictResolver {
     pub fn abort_current_operation(&self) -> Result<()> {
         match self.get_git_state()? {
             GitState::Rebasing => {
-                run_git_command(&["rebase", "--abort"])?;
+                self.git_repo.run(&["rebase", "--abort"])?;
                 print_info("Rebase aborted");
             }
             GitState::Merging => {
-                run_git_command(&["merge", "--abort"])?;
+                self.git_repo.run(&["merge", "--abort"])?;
                 print_info("Merge aborted");
             }
             GitState::CherryPicking => {
-                run_git_command(&["cherry-pick", "--abort"])?;
+                self.git_repo.run(&["cherry-pick", "--abort"])?;
                 print_info("Cherry-pick aborted");
             }
             _ => {

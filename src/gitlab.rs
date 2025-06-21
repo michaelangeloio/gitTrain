@@ -1,5 +1,5 @@
 use crate::errors::TrainError;
-use crate::utils::run_git_command;
+use crate::git::GitRepository;
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -58,10 +58,11 @@ pub struct GitLabClient {
     token: String,
     project_info: RwLock<Option<ProjectInfo>>,
     project_details: RwLock<Option<GitLabProject>>,
+    git_repo: GitRepository,
 }
 
 impl GitLabClient {
-    pub async fn new() -> Result<Self> {
+    pub async fn new(git_repo: GitRepository) -> Result<Self> {
         let token = std::env::var("GITLAB_TOKEN").map_err(|_| TrainError::SecurityError {
             message: "GITLAB_TOKEN environment variable not set".to_string(),
         })?;
@@ -77,6 +78,7 @@ impl GitLabClient {
             token,
             project_info: RwLock::new(None),
             project_details: RwLock::new(None),
+            git_repo,
         })
     }
 
@@ -135,7 +137,7 @@ impl GitLabClient {
 
     async fn detect_project_from_remotes(&self) -> Result<(ProjectInfo, GitLabProject)> {
         // Get all git remotes
-        let remotes_output = run_git_command(&["remote", "-v"])?;
+        let remotes_output = self.git_repo.run(&["remote", "-v"])?;
 
         for line in remotes_output.lines() {
             if let Some(project_info) = Self::parse_gitlab_remote(line)? {

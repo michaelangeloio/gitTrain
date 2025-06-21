@@ -1,8 +1,6 @@
 use anyhow::Result;
 use console::{style, Term};
 use inquire::{Confirm, Select, Text};
-use std::process::Command;
-use tracing::{error, info};
 
 pub fn confirm_action(message: &str) -> Result<bool> {
     let confirmation = Confirm::new(message).with_default(false).prompt()?;
@@ -30,13 +28,10 @@ pub fn select_from_list<T: ToString + Clone>(items: &[T], prompt: &str) -> Resul
 
 pub fn get_user_input(prompt: &str, default: Option<&str>) -> Result<String> {
     let mut input = Text::new(prompt);
-
     if let Some(default_value) = default {
         input = input.with_default(default_value);
     }
-
-    let result = input.prompt()?;
-    Ok(result)
+    input.prompt().map_err(anyhow::Error::from)
 }
 
 #[derive(Debug, Clone)]
@@ -243,7 +238,7 @@ pub fn print_success(message: &str) {
 }
 
 pub fn print_warning(message: &str) {
-    println!("{} {}", style("⚠").bold().yellow(), message);
+    println!("⚠️ {}", message);
 }
 
 pub fn print_error(message: &str) {
@@ -293,21 +288,6 @@ pub fn sanitize_branch_name(name: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_lowercase()
-}
-
-pub fn run_git_command(args: &[&str]) -> Result<String> {
-    info!("Running git command: git {}", args.join(" "));
-
-    let output = Command::new("git").args(args).output()?;
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(stdout.trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        error!("Git command failed: {}", stderr);
-        Err(anyhow::anyhow!("Git command failed: {}", stderr))
-    }
 }
 
 pub fn get_current_timestamp() -> String {

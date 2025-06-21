@@ -1,56 +1,38 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use chrono::Utc;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::config::TrainConfig;
 use crate::conflict::{ConflictResolver, GitState};
 use crate::errors::TrainError;
-use crate::gitlab::{CreateMergeRequestRequest, GitLabClient, GitLabProject};
+use crate::git::GitRepository;
+use crate::gitlab::{CreateMergeRequestRequest, GitLabClient};
+use crate::stack::state::StackState;
+use crate::stack::types::{Stack, StackBranch};
 use crate::utils::{
     confirm_action, create_backup_name, get_user_input, print_error, print_info, print_success,
-    print_train_header, print_warning, run_git_command, sanitize_branch_name, MrStatusInfo,
+    print_train_header, print_warning, sanitize_branch_name, MrStatusInfo,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StackBranch {
-    pub name: String,
-    pub parent: Option<String>,
-    pub children: Vec<String>,
-    pub commit_hash: String,
-    pub mr_iid: Option<u64>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Stack {
-    pub id: String,
-    pub name: String,
-    pub base_branch: String,
-    pub branches: HashMap<String, StackBranch>,
-    pub current_branch: Option<String>,
-    pub gitlab_project: Option<GitLabProject>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
 pub struct StackManager {
-    train_dir: PathBuf,
+    stack_state: StackState,
     current_stack: Option<Stack>,
     gitlab_client: Option<GitLabClient>,
     config: TrainConfig,
     conflict_resolver: ConflictResolver,
+    git_repo: GitRepository,
 }
 
 impl StackManager {
     pub async fn new_with_config(config: TrainConfig) -> Result<Self> {
-        let git_dir = Self::find_git_dir()?;
-        let train_dir = git_dir.join("train");
+        let git_repo = GitRepository::new_from_current_dir()?;
+        let git_dir = git_repo.run(&["rev-parse", "--git-dir"])?;
+        let git_dir_path = std::path::PathBuf::from(git_dir.trim()).canonicalize()?;
+
+        let train_dir = git_dir_path.join("train");
 
         // Create train directory if it doesn't exist
         if !train_dir.exists() {
@@ -59,7 +41,7 @@ impl StackManager {
         }
 
         // Try to initialize GitLab client
-        let gitlab_client = match GitLabClient::new().await {
+        let gitlab_client = match GitLabClient::new(git_repo.clone()).await {
             Ok(client) => {
                 print_info("GitLab integration initialized");
                 Some(client)
@@ -71,14 +53,17 @@ impl StackManager {
         };
 
         // Initialize conflict resolver
-        let conflict_resolver = ConflictResolver::new(config.clone(), git_dir.clone());
+        let conflict_resolver =
+            ConflictResolver::new(config.clone(), git_dir_path.clone(), git_repo.clone());
+        let stack_state = StackState::new(train_dir)?;
 
         Ok(Self {
-            train_dir,
+            stack_state,
             current_stack: None,
             gitlab_client,
             config,
             conflict_resolver,
+            git_repo,
         })
     }
 
@@ -99,12 +84,12 @@ impl StackManager {
         // Create backup if configured
         if self.config.conflict_resolution.backup_on_conflict {
             let backup_branch = create_backup_name(branch);
-            run_git_command(&["branch", &backup_branch])?;
+            self.git_repo.run(&["branch", &backup_branch])?;
             print_info(&format!("Created backup branch: {}", backup_branch));
         }
 
         // Attempt the rebase
-        match run_git_command(&["rebase", onto]) {
+        match self.git_repo.run(&["rebase", onto]) {
             Ok(_) => {
                 print_success(&format!("Rebased {} onto {} successfully", branch, onto));
                 Ok(())
@@ -124,7 +109,7 @@ impl StackManager {
                         .await?
                     {
                         // Continue the rebase
-                        run_git_command(&["rebase", "--continue"])?;
+                        self.git_repo.run(&["rebase", "--continue"])?;
                         print_success("Auto-resolved conflicts and completed rebase");
                         Ok(())
                     } else {
@@ -182,28 +167,14 @@ impl StackManager {
         }
     }
 
-    fn find_git_dir() -> Result<PathBuf> {
-        let output = run_git_command(&["rev-parse", "--git-dir"])?;
-        let git_dir = PathBuf::from(output.trim());
-
-        if !git_dir.exists() {
-            return Err(TrainError::GitError {
-                message: "Not in a git repository".to_string(),
-            }
-            .into());
-        }
-
-        Ok(git_dir.canonicalize()?)
-    }
-
     pub async fn create_stack(&mut self, name: &str) -> Result<()> {
         print_train_header(&format!("Creating Stack: {}", name));
 
         // Ensure we're on a clean working directory
         self.ensure_clean_working_directory()?;
 
-        let current_branch = self.get_current_branch()?;
-        let current_commit = self.get_current_commit_hash()?;
+        let current_branch = self.git_repo.get_current_branch()?;
+        let current_commit = self.git_repo.get_current_commit_hash()?;
         let base_branch = self.determine_base_branch(&current_branch)?;
 
         let sanitized_name = sanitize_branch_name(name);
@@ -256,7 +227,7 @@ impl StackManager {
         stack.branches.insert(current_branch.clone(), branch);
 
         // Save the stack
-        self.save_stack_state(&stack)?;
+        self.stack_state.save_stack(&stack)?;
         self.current_stack = Some(stack);
 
         print_success(&format!(
@@ -274,7 +245,7 @@ impl StackManager {
     pub async fn save_changes(&mut self, message: &str) -> Result<()> {
         print_train_header("Saving Changes");
 
-        let stack = self.load_current_stack()?;
+        let stack = self.get_or_load_current_stack()?;
         let current_branch = self.get_current_branch()?;
 
         // Ensure the current branch is part of the stack
@@ -296,12 +267,12 @@ impl StackManager {
 
         // Create a backup before making changes
         let backup_branch = create_backup_name(&current_branch);
-        run_git_command(&["branch", &backup_branch])?;
+        self.git_repo.run(&["branch", &backup_branch])?;
         print_info(&format!("Created backup branch: {}", backup_branch));
 
         // Commit the changes
-        run_git_command(&["add", "."])?;
-        run_git_command(&["commit", "-m", message])?;
+        self.git_repo.run(&["add", "."])?;
+        self.git_repo.run(&["commit", "-m", message])?;
 
         let new_commit_hash = self.get_current_commit_hash()?;
         print_success(&format!("Committed changes: {}", &new_commit_hash[..8]));
@@ -319,7 +290,7 @@ impl StackManager {
             .await?;
 
         // Save the updated stack
-        self.save_stack_state(&updated_stack)?;
+        self.stack_state.save_stack(&updated_stack)?;
         self.current_stack = Some(updated_stack);
 
         print_success("Changes saved and propagated to dependent branches");
@@ -330,7 +301,7 @@ impl StackManager {
     pub async fn amend_changes(&mut self, new_message: Option<&str>) -> Result<()> {
         print_train_header("Amending Changes");
 
-        let stack = self.load_current_stack()?;
+        let stack = self.get_or_load_current_stack()?;
         let current_branch = self.get_current_branch()?;
 
         // Ensure the current branch is part of the stack
@@ -346,25 +317,26 @@ impl StackManager {
 
         // Create a backup before making changes
         let backup_branch = create_backup_name(&current_branch);
-        run_git_command(&["branch", &backup_branch])?;
+        self.git_repo.run(&["branch", &backup_branch])?;
         print_info(&format!("Created backup branch: {}", backup_branch));
 
         // Amend the current commit
         if let Some(message) = new_message {
             // Amend with new message
-            run_git_command(&["commit", "--amend", "-m", message])?;
+            self.git_repo
+                .run(&["commit", "--amend", "-m", message])?;
             print_success(&format!("Amended commit with new message: {}", message));
         } else {
             // Check if there are staged changes to amend
-            let staged_output = run_git_command(&["diff", "--cached", "--name-only"])?;
+            let staged_output = self.git_repo.run(&["diff", "--cached", "--name-only"])?;
             if staged_output.trim().is_empty() {
                 // No staged changes, just amend message
-                run_git_command(&["commit", "--amend", "--no-edit"])?;
+                self.git_repo.run(&["commit", "--amend", "--no-edit"])?;
                 print_success("Amended commit (no changes)");
             } else {
                 // Stage all changes and amend
-                run_git_command(&["add", "."])?;
-                run_git_command(&["commit", "--amend", "--no-edit"])?;
+                self.git_repo.run(&["add", "."])?;
+                self.git_repo.run(&["commit", "--amend", "--no-edit"])?;
                 print_success("Amended commit with staged changes");
             }
         }
@@ -386,7 +358,7 @@ impl StackManager {
             .await?;
 
         // Save the updated stack
-        self.save_stack_state(&updated_stack)?;
+        self.stack_state.save_stack(&updated_stack)?;
         self.current_stack = Some(updated_stack);
 
         print_success("Changes amended and downstream branches resynced");
@@ -397,7 +369,7 @@ impl StackManager {
     /// Intelligently detect the best parent branch by analyzing git history
     async fn detect_smart_parent(&self, current_branch: &str, stack: &Stack) -> Result<String> {
         // Get the commits in the current branch that are not in the base branch
-        let commits_output = run_git_command(&[
+        let commits_output = self.git_repo.run(&[
             "rev-list",
             &format!("{}..{}", stack.base_branch, current_branch),
             "--reverse",
@@ -416,7 +388,7 @@ impl StackManager {
 
         for branch_name in stack.branches.keys() {
             // Get commits in this stack branch
-            let branch_commits_output = run_git_command(&[
+            let branch_commits_output = self.git_repo.run(&[
                 "rev-list",
                 &format!("{}..{}", stack.base_branch, branch_name),
             ])?;
@@ -457,7 +429,7 @@ impl StackManager {
     pub async fn add_branch_to_stack(&mut self, parent: Option<&str>) -> Result<()> {
         print_train_header("Adding Branch to Stack");
 
-        let mut stack = self.load_current_stack()?;
+        let mut stack = self.get_or_load_current_stack()?;
         let current_branch = self.get_current_branch()?;
 
         // Check if branch is already in the stack
@@ -503,7 +475,7 @@ impl StackManager {
         stack.updated_at = Utc::now();
 
         // Save the updated stack
-        self.save_stack_state(&stack)?;
+        self.stack_state.save_stack(&stack)?;
         self.current_stack = Some(stack);
 
         print_success(&format!(
@@ -517,52 +489,35 @@ impl StackManager {
     pub async fn list_stacks(&self) -> Result<()> {
         print_train_header("Available Stacks");
 
-        let stack_files = std::fs::read_dir(&self.train_dir)?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-                if path.extension()? == "json" && path.file_name()? != "current.json" {
-                    Some(path)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let stacks = self.stack_state.list()?;
 
-        if stack_files.is_empty() {
+        if stacks.is_empty() {
             print_info("No stacks found");
             return Ok(());
         }
 
-        let current_stack_id = std::fs::read_to_string(self.train_dir.join("current.json"))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+        let current_stack_id = self.stack_state.get_current_stack_id().unwrap_or_default();
 
-        for stack_file in stack_files {
-            if let Ok(stack_json) = std::fs::read_to_string(&stack_file) {
-                if let Ok(stack) = serde_json::from_str::<Stack>(&stack_json) {
-                    let is_current = if current_stack_id == stack.id {
-                        " (current)"
-                    } else {
-                        ""
-                    };
-                    let project_info = if let Some(project) = &stack.gitlab_project {
-                        format!(" | Project: {}/{}", project.namespace.path, project.path)
-                    } else {
-                        String::new()
-                    };
+        for stack in stacks {
+            let is_current = if current_stack_id == stack.id {
+                " (current)"
+            } else {
+                ""
+            };
+            let project_info = if let Some(project) = &stack.gitlab_project {
+                format!(" | Project: {}/{}", project.namespace.path, project.path)
+            } else {
+                String::new()
+            };
 
-                    println!("▶ {} ({}){}", stack.name, &stack.id[..8], is_current);
-                    println!(
-                        "   └─ Base: {} | Branches: {} | Updated: {}{}",
-                        stack.base_branch,
-                        stack.branches.len(),
-                        stack.updated_at.format("%Y-%m-%d %H:%M"),
-                        project_info
-                    );
-                }
-            }
+            println!("▶ {} ({}){}", stack.name, &stack.id[..8], is_current);
+            println!(
+                "   └─ Base: {} | Branches: {} | Updated: {}{}",
+                stack.base_branch,
+                stack.branches.len(),
+                stack.updated_at.format("%Y-%m-%d %H:%M"),
+                project_info
+            );
         }
 
         Ok(())
@@ -571,11 +526,10 @@ impl StackManager {
     pub async fn switch_stack(&mut self, stack_identifier: &str) -> Result<()> {
         print_train_header(&format!("Switching to Stack: {}", stack_identifier));
 
-        let stack = self.find_stack_by_identifier(stack_identifier)?;
+        let stack = self.stack_state.find_by_identifier(stack_identifier)?;
 
         // Update the current stack pointer
-        let current_file = self.train_dir.join("current.json");
-        std::fs::write(&current_file, &stack.id)?;
+        self.stack_state.set_current(&stack)?;
 
         self.current_stack = Some(stack.clone());
 
@@ -594,17 +548,15 @@ impl StackManager {
     pub async fn delete_stack(&mut self, stack_identifier: &str, force: bool) -> Result<()> {
         print_train_header(&format!("Deleting Stack: {}", stack_identifier));
 
-        let stack = self.find_stack_by_identifier(stack_identifier)?;
-        let stack_file = self.train_dir.join(format!("{}.json", stack.id));
+        let stack = self.stack_state.find_by_identifier(stack_identifier)?;
 
         // Check if this is the current stack
-        let current_file = self.train_dir.join("current.json");
-        let is_current_stack = if let Ok(current_stack_id) = std::fs::read_to_string(&current_file)
-        {
-            current_stack_id.trim() == stack.id
-        } else {
-            false
-        };
+        let is_current_stack =
+            if let Ok(current_stack_id) = self.stack_state.get_current_stack_id() {
+                current_stack_id.trim() == stack.id
+            } else {
+                false
+            };
 
         // Show what will be deleted
         print_warning(&format!(
@@ -644,14 +596,11 @@ impl StackManager {
         }
 
         // Delete the stack file
-        std::fs::remove_file(&stack_file)?;
-        print_success(&format!("Deleted stack file: {:?}", stack_file));
+        self.stack_state.delete(&stack)?;
+        print_success(&format!("Deleted stack config for: {}", stack.name));
 
         // If this was the current stack, clear the current stack reference
         if is_current_stack {
-            if current_file.exists() {
-                std::fs::remove_file(&current_file)?;
-            }
             self.current_stack = None;
             print_info("Cleared current stack reference");
         }
@@ -694,7 +643,7 @@ impl StackManager {
         self.print_branch_hierarchy_with_status(&hierarchy, &stack, &branch_mr_status, 0);
 
         // Show working directory status
-        let status_output = run_git_command(&["status", "--porcelain"])?;
+        let status_output = self.git_repo.run(&["status", "--porcelain"])?;
         if !status_output.is_empty() {
             println!("\nWorking directory status:");
             println!("{}", status_output);
@@ -710,7 +659,7 @@ impl StackManager {
 
         loop {
             // Load current stack state
-            let stack = match self.load_current_stack() {
+            let stack = match self.get_or_load_current_stack() {
                 Ok(stack) => {
                     self.current_stack = Some(stack.clone());
                     stack
@@ -796,11 +745,12 @@ impl StackManager {
         // Ensure working directory is clean
         if self.ensure_clean_working_directory().is_err() {
             print_warning("Working directory is not clean. Stashing changes...");
-            run_git_command(&["stash", "push", "-m", "git-train navigation stash"])?;
+            self.git_repo
+                .run(&["stash", "push", "-m", "git-train navigation stash"])?;
         }
 
         // Switch to the branch
-        run_git_command(&["checkout", branch_name])?;
+        self.git_repo.run(&["checkout", branch_name])?;
         print_success(&format!("Switched to branch: {}", branch_name));
 
         Ok(())
@@ -844,7 +794,8 @@ impl StackManager {
 
             // Show commit info
             if let Ok(commit_info) =
-                run_git_command(&["show", "--oneline", "-s", &branch.commit_hash])
+                self.git_repo
+                    .run(&["show", "--oneline", "-s", &branch.commit_hash])
             {
                 println!("Commit info: {}", commit_info);
             }
@@ -869,7 +820,7 @@ impl StackManager {
                 .await?;
 
                 // Save the updated stack
-                self.save_stack_state(&stack_mut)?;
+                self.stack_state.save_stack(&stack_mut)?;
                 self.current_stack = Some(stack_mut);
 
                 print_success(&format!(
@@ -924,7 +875,7 @@ impl StackManager {
     pub async fn push_stack(&mut self) -> Result<()> {
         print_train_header("Pushing Stack");
 
-        let mut stack = self.load_current_stack()?;
+        let mut stack = self.get_or_load_current_stack()?;
         let mut push_failures = Vec::new();
         let mut successful_pushes = Vec::new();
 
@@ -933,7 +884,7 @@ impl StackManager {
             print_info(&format!("Pushing branch: {}", branch_name));
 
             // First try a normal push
-            match run_git_command(&[
+            match self.git_repo.run(&[
                 "push",
                 "origin",
                 &format!("{}:{}", branch_name, branch_name),
@@ -956,7 +907,7 @@ impl StackManager {
 
                         // Check if we should force push safely
                         if self.should_force_push_branch(branch_name, &stack).await? {
-                            match run_git_command(&[
+                            match self.git_repo.run(&[
                                 "push",
                                 "--force-with-lease",
                                 "origin",
@@ -1019,7 +970,7 @@ impl StackManager {
             .await;
 
         // Save the updated stack with MR IIDs
-        self.save_stack_state(&stack)?;
+        self.stack_state.save_stack(&stack)?;
         self.current_stack = Some(stack);
 
         if push_failures.is_empty() {
@@ -1036,7 +987,9 @@ impl StackManager {
         // Safety checks for force-push
 
         // 1. Check if the branch exists remotely
-        let remote_exists = run_git_command(&["ls-remote", "--heads", "origin", branch_name])
+        let remote_exists = self
+            .git_repo
+            .run(&["ls-remote", "--heads", "origin", branch_name])
             .map(|output| !output.trim().is_empty())
             .unwrap_or(false);
 
@@ -1086,7 +1039,7 @@ impl StackManager {
         }
 
         // 4. Additional safety: ensure we're not too far ahead (sanity check)
-        match run_git_command(&[
+        match self.git_repo.run(&[
             "rev-list",
             "--count",
             &format!("origin/{}..{}", branch_name, branch_name),
@@ -1199,7 +1152,7 @@ impl StackManager {
                         );
                         match git_state {
                             GitState::Rebasing => {
-                                match run_git_command(&["rebase", "--continue"]) {
+                                match self.git_repo.run(&["rebase", "--continue"]) {
                                     Ok(_) => {
                                         print_success("Successfully continued rebase");
                                         Ok(())
@@ -1209,7 +1162,7 @@ impl StackManager {
                                             "Could not continue rebase. Offering to abort...",
                                         );
                                         if confirm_action("Abort the rebase?")? {
-                                            run_git_command(&["rebase", "--abort"])?;
+                                            self.git_repo.run(&["rebase", "--abort"])?;
                                             print_success(
                                                 "Rebase aborted. Repository is now clean.",
                                             );
@@ -1224,7 +1177,7 @@ impl StackManager {
                                     }
                                 }
                             }
-                            GitState::Merging => match run_git_command(&["commit", "--no-edit"]) {
+                            GitState::Merging => match self.git_repo.run(&["commit", "--no-edit"]) {
                                 Ok(_) => {
                                     print_success("Successfully completed merge");
                                     Ok(())
@@ -1232,7 +1185,7 @@ impl StackManager {
                                 Err(_) => {
                                     print_warning("Could not complete merge. Offering to abort...");
                                     if confirm_action("Abort the merge?")? {
-                                        run_git_command(&["merge", "--abort"])?;
+                                        self.git_repo.run(&["merge", "--abort"])?;
                                         print_success("Merge aborted. Repository is now clean.");
                                         Ok(())
                                     } else {
@@ -1245,7 +1198,7 @@ impl StackManager {
                                 }
                             },
                             GitState::CherryPicking => {
-                                match run_git_command(&["cherry-pick", "--continue"]) {
+                                match self.git_repo.run(&["cherry-pick", "--continue"]) {
                                     Ok(_) => {
                                         print_success("Successfully continued cherry-pick");
                                         Ok(())
@@ -1255,7 +1208,7 @@ impl StackManager {
                                             "Could not continue cherry-pick. Offering to abort...",
                                         );
                                         if confirm_action("Abort the cherry-pick?")? {
-                                            run_git_command(&["cherry-pick", "--abort"])?;
+                                            self.git_repo.run(&["cherry-pick", "--abort"])?;
                                             print_success(
                                                 "Cherry-pick aborted. Repository is now clean.",
                                             );
@@ -1304,7 +1257,7 @@ impl StackManager {
             return Err(e);
         }
 
-        let stack = self.load_current_stack()?;
+        let stack = self.get_or_load_current_stack()?;
         let current_branch = self.get_current_branch()?;
 
         // Ensure working directory is clean
@@ -1312,8 +1265,8 @@ impl StackManager {
 
         // Update the base branch
         print_info(&format!("Updating base branch: {}", stack.base_branch));
-        run_git_command(&["checkout", &stack.base_branch])?;
-        run_git_command(&["pull", "origin", &stack.base_branch])?;
+        self.git_repo.run(&["checkout", &stack.base_branch])?;
+        self.git_repo.run(&["pull", "origin", &stack.base_branch])?;
 
         // Rebase all stack branches with better error handling
         let mut updated_stack = stack.clone();
@@ -1333,7 +1286,7 @@ impl StackManager {
                 print_info("• Run 'git-train sync' again after resolving issues");
 
                 // Try to return to a safe state
-                if run_git_command(&["checkout", &current_branch]).is_err() {
+                if self.git_repo.run(&["checkout", &current_branch]).is_err() {
                     print_warning(&format!("Could not return to original branch '{}'. You may need to checkout manually.", current_branch));
                 }
 
@@ -1352,10 +1305,10 @@ impl StackManager {
         }
 
         // Switch back to the original branch
-        run_git_command(&["checkout", &current_branch])?;
+        self.git_repo.run(&["checkout", &current_branch])?;
 
         // Save the updated stack
-        self.save_stack_state(&updated_stack)?;
+        self.stack_state.save_stack(&updated_stack)?;
         self.current_stack = Some(updated_stack);
 
         print_success("Stack synchronized with remote and MR targets updated");
@@ -1364,16 +1317,15 @@ impl StackManager {
     }
 
     pub fn get_current_branch(&self) -> Result<String> {
-        run_git_command(&["branch", "--show-current"])
+        self.git_repo.get_current_branch()
     }
 
     fn get_current_commit_hash(&self) -> Result<String> {
-        run_git_command(&["rev-parse", "HEAD"])
+        self.git_repo.get_current_commit_hash()
     }
 
     pub fn has_uncommitted_changes(&self) -> Result<bool> {
-        let output = run_git_command(&["status", "--porcelain"])?;
-        Ok(!output.trim().is_empty())
+        self.git_repo.has_uncommitted_changes()
     }
 
     fn ensure_clean_working_directory(&self) -> Result<()> {
@@ -1389,11 +1341,11 @@ impl StackManager {
     }
 
     /// Gets the current stack, loading it if not already cached
-    fn get_or_load_current_stack(&mut self) -> Result<Stack> {
+    pub fn get_or_load_current_stack(&mut self) -> Result<Stack> {
         match &self.current_stack {
             Some(stack) => Ok(stack.clone()),
             None => {
-                let stack = self.load_current_stack()?;
+                let stack = self.stack_state.load_current()?;
                 self.current_stack = Some(stack.clone());
                 Ok(stack)
             }
@@ -1509,36 +1461,6 @@ impl StackManager {
         }
     }
 
-    /// Find a stack by name or ID prefix
-    fn find_stack_by_identifier(&self, stack_identifier: &str) -> Result<Stack> {
-        let stack_files = std::fs::read_dir(&self.train_dir)?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-                if path.extension()? == "json" && path.file_name()? != "current.json" {
-                    Some(path)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        for stack_file in stack_files {
-            if let Ok(stack_json) = std::fs::read_to_string(&stack_file) {
-                if let Ok(stack) = serde_json::from_str::<Stack>(&stack_json) {
-                    if stack.name == stack_identifier || stack.id.starts_with(stack_identifier) {
-                        return Ok(stack);
-                    }
-                }
-            }
-        }
-
-        Err(TrainError::StackError {
-            message: format!("Stack '{}' not found", stack_identifier),
-        }
-        .into())
-    }
-
     fn print_branch_hierarchy_with_status(
         &self,
         hierarchy: &HashMap<String, Vec<String>>,
@@ -1627,51 +1549,42 @@ impl StackManager {
         }
     }
 
-    fn determine_base_branch(&self, current_branch: &str) -> Result<String> {
-        // Try to determine the base branch by checking common base branches
-        let potential_bases = ["main", "master", "develop", "dev"];
-
-        for base in &potential_bases {
-            if run_git_command(&["merge-base", current_branch, base]).is_ok() {
-                return Ok(base.to_string());
+    fn determine_base_branch(&self, _current_branch: &str) -> Result<String> {
+        // Simple strategy: check for 'main' or 'master'
+        for branch in ["main", "master"] {
+            if self
+                .git_repo
+                .run(&["rev-parse", "--verify", branch])
+                .is_ok()
+            {
+                return Ok(branch.to_string());
             }
         }
-
-        // If no common base found, ask the user
-        let base = get_user_input("Enter base branch name", Some("main"))?;
-        Ok(base)
+        // Fallback to a warning and user input if needed
+        print_warning("Could not determine a default base branch ('main' or 'master' not found)");
+        get_user_input("Please enter the base branch name:", None).map_err(anyhow::Error::from)
     }
 
     async fn propagate_changes(&self, stack: &mut Stack, changed_branch: &str) -> Result<()> {
         let hierarchy = self.build_branch_hierarchy(stack);
-
         if let Some(children) = hierarchy.get(changed_branch) {
-            for child_branch in children {
-                print_info(&format!("Propagating changes to: {}", child_branch));
+            for child_branch_name in children {
+                print_info(&format!(
+                    "Propagating changes to child branch: {}",
+                    child_branch_name
+                ));
 
-                // Checkout the child branch
-                run_git_command(&["checkout", child_branch])?;
+                self.git_repo.run(&["checkout", child_branch_name])?;
+                self.smart_rebase(child_branch_name, changed_branch)
+                    .await?;
 
-                // Attempt smart rebase with conflict resolution
-                if let Err(e) = self.smart_rebase(child_branch, changed_branch).await {
-                    print_error(&format!("Failed to rebase {}: {}", child_branch, e));
-                    // Continue with other branches
-                    continue;
-                }
-
-                // Update stack state on successful rebase
-                let new_commit = self.get_current_commit_hash()?;
-                if let Some(branch) = stack.branches.get_mut(child_branch) {
-                    branch.commit_hash = new_commit;
+                // Update commit hash
+                if let Some(branch) = stack.branches.get_mut(child_branch_name) {
+                    branch.commit_hash = self.get_current_commit_hash()?;
                     branch.updated_at = Utc::now();
                 }
-                print_success(&format!("Rebased {} onto {}", child_branch, changed_branch));
-
-                // Recursively propagate to grandchildren
-                Box::pin(self.propagate_changes(stack, child_branch)).await?;
             }
         }
-
         Ok(())
     }
 
@@ -1696,73 +1609,81 @@ impl StackManager {
         hierarchy: &HashMap<String, Vec<String>>,
         base_branch: &str,
     ) -> Result<()> {
-        let mut failed_branches = Vec::new();
+        let mut rebased_branches = std::collections::HashSet::new();
 
-        // Rebase branches in order of dependency
-        if let Some(children) = hierarchy.get(base_branch) {
-            for child in children {
-                print_info(&format!("Rebasing {} onto {}", child, base_branch));
+        // Start with branches that have the base branch as a parent
+        let mut branches_to_rebase: Vec<String> = hierarchy
+            .iter()
+            .filter(|(child, _)| {
+                stack
+                    .branches
+                    .get(*child)
+                    .and_then(|b| b.parent.as_ref())
+                    == Some(&base_branch.to_string())
+            })
+            .map(|(child, _)| child.clone())
+            .collect();
 
-                run_git_command(&["checkout", child])?;
+        // Sort for consistent order
+        branches_to_rebase.sort();
 
-                // Use smart rebase with conflict resolution
-                match self.smart_rebase(child, base_branch).await {
-                    Ok(_) => {
-                        // Update stack state on successful rebase
-                        let new_commit = self.get_current_commit_hash()?;
-                        if let Some(branch) = stack.branches.get_mut(child) {
-                            branch.commit_hash = new_commit;
-                            branch.updated_at = Utc::now();
-                        }
-                        print_success(&format!("Rebased {}", child));
+        let mut all_rebased_ok = true;
 
-                        // Recursively rebase children
-                        if let Err(e) =
-                            Box::pin(self.rebase_branch_hierarchy(stack, hierarchy, child)).await
-                        {
-                            print_error(&format!("Failed to rebase children of {}: {}", child, e));
-                            // Don't fail the entire operation, but track the error
-                            failed_branches.push(format!("children of {}", child));
+        while let Some(branch_name) = branches_to_rebase.pop() {
+            if rebased_branches.contains(&branch_name) {
+                continue;
+            }
+
+            let parent_branch_name = stack
+                .branches
+                .get(&branch_name)
+                .and_then(|b| b.parent.clone())
+                .unwrap_or_else(|| base_branch.to_string());
+
+            print_info(&format!(
+                "Rebasing '{}' onto '{}'",
+                branch_name, parent_branch_name
+            ));
+            self.git_repo.run(&["checkout", &branch_name])?;
+
+            match self
+                .smart_rebase(&branch_name, &parent_branch_name)
+                .await
+            {
+                Ok(_) => {
+                    // Update commit hash
+                    if let Some(branch) = stack.branches.get_mut(&branch_name) {
+                        branch.commit_hash = self.get_current_commit_hash()?;
+                        branch.updated_at = Utc::now();
+                    }
+                    rebased_branches.insert(branch_name.clone());
+
+                    // Add children of this branch to the queue
+                    if let Some(children) = hierarchy.get(&branch_name) {
+                        for child in children {
+                            branches_to_rebase.push(child.clone());
                         }
                     }
-                    Err(e) => {
-                        print_error(&format!("Failed to rebase {}: {}", child, e));
-                        failed_branches.push(child.clone());
-
-                        // Check if we're in a state that needs recovery
-                        let git_state = self.conflict_resolver.get_git_state()?;
-                        if !matches!(git_state, GitState::Clean) {
-                            print_warning(&format!(
-                                "Git is in state {:?} after failed rebase of {}",
-                                git_state, child
-                            ));
-                            print_info(
-                                "Stopping hierarchy rebase. Resolve conflicts and run sync again.",
-                            );
-
-                            if !failed_branches.is_empty() {
-                                return Err(TrainError::GitError {
-                                    message: format!("Rebase failed for branch '{}'. Repository needs attention.", child),
-                                }.into());
-                            }
-                        }
-
-                        // Continue with other branches if git state is clean
-                        continue;
-                    }
+                }
+                Err(e) => {
+                    print_error(&format!(
+                        "Failed to rebase branch '{}': {}",
+                        branch_name, e
+                    ));
+                    all_rebased_ok = false;
+                    // Don't proceed with children if parent fails
                 }
             }
         }
 
-        if !failed_branches.is_empty() {
-            print_warning(&format!(
-                "The following branches failed to rebase: {}",
-                failed_branches.join(", ")
-            ));
-            print_info("You may need to resolve conflicts manually for these branches.");
+        if all_rebased_ok {
+            Ok(())
+        } else {
+            Err(TrainError::GitError {
+                message: "One or more branches failed to rebase".to_string(),
+            }
+            .into())
         }
-
-        Ok(())
     }
 
     /// Intelligently determine the optimal target branch for a given branch in the stack
@@ -1833,7 +1754,7 @@ impl StackManager {
                     }
                 } else {
                     // Parent branch exists but has no MR, check if the branch itself still exists
-                    match run_git_command(&[
+                    match self.git_repo.run(&[
                         "rev-parse",
                         "--verify",
                         &format!("origin/{}", current_parent),
@@ -1975,45 +1896,6 @@ impl StackManager {
         }
 
         Ok(())
-    }
-
-    fn save_stack_state(&self, stack: &Stack) -> Result<()> {
-        let stack_file = self.train_dir.join(format!("{}.json", stack.id));
-        let stack_json = serde_json::to_string_pretty(stack)?;
-
-        fs::write(&stack_file, stack_json)?;
-
-        // Also save a "current" symlink/file for easy access
-        let current_file = self.train_dir.join("current.json");
-        fs::write(&current_file, &stack.id)?;
-
-        info!("Saved stack state to: {:?}", stack_file);
-        Ok(())
-    }
-
-    pub fn load_current_stack(&self) -> Result<Stack> {
-        let current_file = self.train_dir.join("current.json");
-        if !current_file.exists() {
-            return Err(TrainError::StackError {
-                message: "No current stack found".to_string(),
-            }
-            .into());
-        }
-
-        let stack_id = fs::read_to_string(&current_file)?;
-        let stack_file = self.train_dir.join(format!("{}.json", stack_id.trim()));
-
-        if !stack_file.exists() {
-            return Err(TrainError::StackError {
-                message: format!("Stack file not found: {:?}", stack_file),
-            }
-            .into());
-        }
-
-        let stack_json = fs::read_to_string(&stack_file)?;
-        let stack: Stack = serde_json::from_str(&stack_json)?;
-
-        Ok(stack)
     }
 }
 
