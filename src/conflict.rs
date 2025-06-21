@@ -79,8 +79,8 @@ impl ConflictResolver {
             if self.is_rebase_actually_active()? {
                 return Ok(GitState::Rebasing);
             } else {
-                // Clean up stale rebase files
-                ui::print_info("Detected stale rebase state files, cleaning up...");
+                // Attempt to abort the leftover rebase safely
+                ui::print_info("Detected stale rebase state files, attempting to abort rebase...");
                 self.cleanup_stale_rebase_files()?;
             }
         }
@@ -90,7 +90,7 @@ impl ConflictResolver {
             if self.is_merge_actually_active()? {
                 return Ok(GitState::Merging);
             } else {
-                ui::print_info("Detected stale merge state files, cleaning up...");
+                ui::print_info("Detected stale merge state files, attempting to abort merge...");
                 self.cleanup_stale_merge_files()?;
             }
         }
@@ -100,7 +100,7 @@ impl ConflictResolver {
             if self.is_cherry_pick_actually_active()? {
                 return Ok(GitState::CherryPicking);
             } else {
-                ui::print_info("Detected stale cherry-pick state files, cleaning up...");
+                ui::print_info("Detected stale cherry-pick state files, attempting to abort cherry-pick...");
                 self.cleanup_stale_cherry_pick_files()?;
             }
         }
@@ -142,74 +142,28 @@ impl ConflictResolver {
 
     /// Clean up stale rebase files
     fn cleanup_stale_rebase_files(&self) -> Result<()> {
-        let git_dir = &self.git_dir;
-        let files_to_remove = [
-            "REBASE_HEAD",
-            "ORIG_HEAD", // Only if it's from a rebase
-        ];
-
-        for file in &files_to_remove {
-            let file_path = git_dir.join(file);
-            if file_path.exists() {
-                if let Err(e) = std::fs::remove_file(&file_path) {
-                    ui::print_warning(&format!("Could not remove stale file {}: {}", file, e));
-                } else {
-                    ui::print_info(&format!("Removed stale file: {}", file));
-                }
-            }
+        match self.git_repo.run(&["rebase", "--abort"]) {
+            Ok(_) => ui::print_info("Aborted stale rebase"),
+            Err(e) => ui::print_warning(&format!("Could not abort rebase: {}", e)),
         }
-
-        // Remove any stale rebase directories
-        let rebase_dirs = ["rebase-merge", "rebase-apply"];
-        for dir in &rebase_dirs {
-            let dir_path = git_dir.join(dir);
-            if dir_path.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&dir_path) {
-                    ui::print_warning(&format!("Could not remove stale directory {}: {}", dir, e));
-                } else {
-                    ui::print_info(&format!("Removed stale directory: {}", dir));
-                }
-            }
-        }
-
         Ok(())
     }
 
     /// Clean up stale merge files
     fn cleanup_stale_merge_files(&self) -> Result<()> {
-        let git_dir = &self.git_dir;
-        let files_to_remove = ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE"];
-
-        for file in &files_to_remove {
-            let file_path = git_dir.join(file);
-            if file_path.exists() {
-                if let Err(e) = std::fs::remove_file(&file_path) {
-                    ui::print_warning(&format!("Could not remove stale file {}: {}", file, e));
-                } else {
-                    ui::print_info(&format!("Removed stale file: {}", file));
-                }
-            }
+        match self.git_repo.run(&["merge", "--abort"]) {
+            Ok(_) => ui::print_info("Aborted stale merge"),
+            Err(e) => ui::print_warning(&format!("Could not abort merge: {}", e)),
         }
-
         Ok(())
     }
 
     /// Clean up stale cherry-pick files
     fn cleanup_stale_cherry_pick_files(&self) -> Result<()> {
-        let git_dir = &self.git_dir;
-        let files_to_remove = ["CHERRY_PICK_HEAD", "CHERRY_PICK_MSG"];
-
-        for file in &files_to_remove {
-            let file_path = git_dir.join(file);
-            if file_path.exists() {
-                if let Err(e) = std::fs::remove_file(&file_path) {
-                    ui::print_warning(&format!("Could not remove stale file {}: {}", file, e));
-                } else {
-                    ui::print_info(&format!("Removed stale file: {}", file));
-                }
-            }
+        match self.git_repo.run(&["cherry-pick", "--abort"]) {
+            Ok(_) => ui::print_info("Aborted stale cherry-pick"),
+            Err(e) => ui::print_warning(&format!("Could not abort cherry-pick: {}", e)),
         }
-
         Ok(())
     }
 
