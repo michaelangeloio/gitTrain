@@ -14,6 +14,8 @@ use crate::utils::{
 };
 use crate::gitlab::{GitLabClient, CreateMergeRequestRequest, GitLabProject};
 use crate::errors::TrainError;
+use crate::config::TrainConfig;
+use crate::conflict::{ConflictResolver, GitState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StackBranch {
@@ -43,10 +45,17 @@ pub struct StackManager {
     train_dir: PathBuf,
     current_stack: Option<Stack>,
     gitlab_client: Option<GitLabClient>,
+    config: TrainConfig,
+    conflict_resolver: ConflictResolver,
 }
 
 impl StackManager {
     pub async fn new() -> Result<Self> {
+        let config = TrainConfig::default();
+        Self::new_with_config(config).await
+    }
+
+    pub async fn new_with_config(config: TrainConfig) -> Result<Self> {
         let git_dir = Self::find_git_dir()?;
         let train_dir = git_dir.join("train");
         
@@ -68,12 +77,83 @@ impl StackManager {
             }
         };
 
+        // Initialize conflict resolver
+        let conflict_resolver = ConflictResolver::new(config.clone(), git_dir.clone());
+
         Ok(Self {
             git_dir,
             train_dir,
             current_stack: None,
             gitlab_client,
+            config,
+            conflict_resolver,
         })
+    }
+
+    pub fn get_conflict_resolver(&self) -> &ConflictResolver {
+        &self.conflict_resolver
+    }
+
+    /// Smart rebase that handles conflicts automatically when possible
+    async fn smart_rebase(&self, branch: &str, onto: &str) -> Result<()> {
+        // First check if we're already in a conflict state
+        let git_state = self.conflict_resolver.get_git_state()?;
+        if !matches!(git_state, GitState::Clean) {
+            return Err(TrainError::InvalidState {
+                message: format!("Cannot rebase: git is in state {:?}", git_state),
+            }.into());
+        }
+
+        // Create backup if configured
+        if self.config.conflict_resolution.backup_on_conflict {
+            let backup_branch = create_backup_name(branch);
+            run_git_command(&["branch", &backup_branch])?;
+            print_info(&format!("Created backup branch: {}", backup_branch));
+        }
+
+        // Attempt the rebase
+        match run_git_command(&["rebase", onto]) {
+            Ok(_) => {
+                print_success(&format!("Rebased {} onto {} successfully", branch, onto));
+                Ok(())
+            }
+            Err(_) => {
+                // Check if we have conflicts
+                if let Some(conflicts) = self.conflict_resolver.detect_conflicts()? {
+                    print_info(&format!("Conflicts detected during rebase of {} onto {}", branch, onto));
+                    
+                    // Try automatic resolution first
+                    if self.conflict_resolver.auto_resolve_conflicts(&conflicts).await? {
+                        // Continue the rebase
+                        run_git_command(&["rebase", "--continue"])?;
+                        print_success(&format!("Auto-resolved conflicts and completed rebase"));
+                        Ok(())
+                    } else {
+                        // Fall back to interactive resolution
+                        match self.config.conflict_resolution.auto_resolve_strategy {
+                            crate::config::AutoResolveStrategy::Never => {
+                                print_warning("Auto-resolution disabled. Please resolve conflicts manually:");
+                                print_info(&format!("Run 'git-train resolve interactive' to resolve conflicts"));
+                                print_info(&format!("Then run 'git-train resolve continue' to complete the rebase"));
+                                Err(TrainError::InvalidState {
+                                    message: "Manual conflict resolution required".to_string(),
+                                }.into())
+                            }
+                            _ => {
+                                // Offer interactive resolution
+                                self.conflict_resolver.resolve_conflicts_interactively(&conflicts).await?;
+                                Ok(())
+                            }
+                        }
+                    }
+                } else {
+                    // Rebase failed for other reasons
+                    Err(TrainError::GitError {
+                        message: format!("Rebase of {} onto {} failed", branch, onto),
+                    }.into())
+                }
+            }
+        }
     }
 
     fn find_git_dir() -> Result<PathBuf> {
@@ -674,21 +754,20 @@ impl StackManager {
                 // Checkout the child branch
                 run_git_command(&["checkout", child_branch])?;
                 
-                // Rebase onto the changed branch
-                match run_git_command(&["rebase", changed_branch]) {
-                    Ok(_) => {
-                        let new_commit = self.get_current_commit_hash()?;
-                        if let Some(branch) = stack.branches.get_mut(child_branch) {
-                            branch.commit_hash = new_commit;
-                            branch.updated_at = Utc::now();
-                        }
-                        print_success(&format!("Rebased {} onto {}", child_branch, changed_branch));
-                    }
-                    Err(e) => {
-                        print_error(&format!("Failed to rebase {}: {}", child_branch, e));
-                        // Continue with other branches
-                    }
+                // Attempt smart rebase with conflict resolution
+                if let Err(e) = self.smart_rebase(child_branch, changed_branch).await {
+                    print_error(&format!("Failed to rebase {}: {}", child_branch, e));
+                    // Continue with other branches
+                    continue;
                 }
+                
+                // Update stack state on successful rebase
+                let new_commit = self.get_current_commit_hash()?;
+                if let Some(branch) = stack.branches.get_mut(child_branch) {
+                    branch.commit_hash = new_commit;
+                    branch.updated_at = Utc::now();
+                }
+                print_success(&format!("Rebased {} onto {}", child_branch, changed_branch));
                 
                 // Recursively propagate to grandchildren
                 Box::pin(self.propagate_changes(stack, child_branch)).await?;
@@ -769,19 +848,21 @@ impl StackManager {
                 print_info(&format!("Rebasing {} onto {}", child, base_branch));
                 
                 run_git_command(&["checkout", child])?;
-                match run_git_command(&["rebase", base_branch]) {
-                    Ok(_) => {
-                        let new_commit = self.get_current_commit_hash()?;
-                        if let Some(branch) = stack.branches.get_mut(child) {
-                            branch.commit_hash = new_commit;
-                            branch.updated_at = Utc::now();
-                        }
-                        print_success(&format!("Rebased {}", child));
-                    }
-                    Err(e) => {
-                        print_error(&format!("Failed to rebase {}: {}", child, e));
-                    }
+                
+                // Use smart rebase with conflict resolution
+                if let Err(e) = self.smart_rebase(child, base_branch).await {
+                    print_error(&format!("Failed to rebase {}: {}", child, e));
+                    // Continue with other branches
+                    continue;
                 }
+                
+                // Update stack state on successful rebase
+                let new_commit = self.get_current_commit_hash()?;
+                if let Some(branch) = stack.branches.get_mut(child) {
+                    branch.commit_hash = new_commit;
+                    branch.updated_at = Utc::now();
+                }
+                print_success(&format!("Rebased {}", child));
                 
                 // Recursively rebase children
                 Box::pin(self.rebase_branch_hierarchy(stack, hierarchy, child)).await?;

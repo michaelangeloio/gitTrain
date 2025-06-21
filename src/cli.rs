@@ -66,4 +66,51 @@ pub enum Commands {
 
     /// Sync with remote (pull latest and rebase)
     Sync,
+
+    /// Configuration management
+    #[command(subcommand)]
+    Config(ConfigCommands),
+
+    /// Conflict resolution commands
+    #[command(subcommand)]
+    Resolve(ResolveCommands),
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommands {
+    /// Show current configuration
+    Show,
+    
+    /// Configure git-train interactively
+    Setup,
+    
+    /// Set default editor
+    SetEditor {
+        /// Editor command (e.g., 'cursor', 'code', 'vim')
+        editor: String,
+    },
+    
+    /// Set conflict resolution strategy
+    SetStrategy {
+        /// Strategy: 'never', 'simple', or 'smart'
+        strategy: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ResolveCommands {
+    /// Check for conflicts in current repository
+    Check,
+    
+    /// Resolve conflicts interactively
+    Interactive,
+    
+    /// Attempt automatic conflict resolution
+    Auto,
+    
+    /// Abort current git operation
+    Abort,
+    
+    /// Continue after resolving conflicts manually
+    Continue,
 } 
