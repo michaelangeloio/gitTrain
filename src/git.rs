@@ -53,7 +53,11 @@ impl GitRepository {
 /// Helper function to run a git command.
 fn run_cmd<P: AsRef<Path>>(args: &[&str], cwd: P) -> Result<String> {
     let args_str = args.join(" ");
-    info!("Running git command: `git {}` in `{:?}`", args_str, cwd.as_ref());
+    info!(
+        "Running git command: `git {}` in `{:?}`",
+        args_str,
+        cwd.as_ref()
+    );
 
     let output = Command::new("git")
         .args(args)
@@ -65,7 +69,10 @@ fn run_cmd<P: AsRef<Path>>(args: &[&str], cwd: P) -> Result<String> {
         Ok(stdout)
     } else {
         let stderr = String::from_utf8(output.stderr)?;
-        error!("Git command `git {}` failed with stderr: {}", args_str, stderr);
+        error!(
+            "Git command `git {}` failed with stderr: {}",
+            args_str, stderr
+        );
         Err(anyhow!(TrainError::GitError { message: stderr }))
     }
-} 
+}

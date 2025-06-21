@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use tracing::info;
 
 use crate::errors::TrainError;
-use crate::utils::{get_user_input, print_info};
+use crate::ui::{get_user_input, print_info};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TrainConfig {

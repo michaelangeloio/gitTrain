@@ -9,6 +9,7 @@ mod errors;
 mod git;
 mod gitlab;
 mod stack;
+mod ui;
 mod utils;
 
 use app::AppContext;

@@ -4,7 +4,7 @@ use crate::{
     cli::{Cli, Commands, ConfigCommands},
     config::{ConfigManager, TrainConfig},
     stack::StackManager,
-    utils,
+    ui,
 };
 
 /// The main application context.
@@ -30,16 +30,15 @@ impl AppContext {
     /// Run the application with the given CLI arguments.
     pub async fn run(&mut self, cli: Cli) -> Result<()> {
         match cli.command {
-            Commands::Config(config_cmd) => {
-                self.handle_config_commands(&config_cmd).await
-            }
+            Commands::Config(config_cmd) => self.handle_config_commands(&config_cmd).await,
             Commands::Health => {
                 let mut stack_manager = self.get_stack_manager().await?;
                 Self::handle_health_command(&mut stack_manager).await
             }
             _ => {
                 let mut stack_manager = self.get_stack_manager().await?;
-                self.handle_stack_commands(cli.command, &mut stack_manager).await
+                self.handle_stack_commands(cli.command, &mut stack_manager)
+                    .await
             }
         }
     }
@@ -50,7 +49,11 @@ impl AppContext {
     }
 
     /// Handle stack-related commands.
-    async fn handle_stack_commands(&self, command: Commands, stack_manager: &mut StackManager) -> Result<()> {
+    async fn handle_stack_commands(
+        &self,
+        command: Commands,
+        stack_manager: &mut StackManager,
+    ) -> Result<()> {
         match command {
             Commands::Create { name } => stack_manager.create_stack(&name).await,
             Commands::Save { message } => stack_manager.save_changes(&message).await,
@@ -73,30 +76,35 @@ impl AppContext {
         match cmd {
             ConfigCommands::Show => {
                 let config = self.config_manager.get_config();
-                println!("Git-Train Configuration:");
-                println!("========================");
-                println!("Editor: {}", config.editor.default_editor);
-                println!("Editor args: {:?}", config.editor.editor_args);
-                println!(
-                    "Auto-resolve strategy: {:?}",
-                    config.conflict_resolution.auto_resolve_strategy
+                ui::print_train_header("Git-Train Configuration");
+                ui::print_config_item("Editor", &config.editor.default_editor);
+                ui::print_config_item("Editor args", &format!("{:?}", config.editor.editor_args));
+                ui::print_config_item(
+                    "Auto-resolve strategy",
+                    &format!("{:?}", config.conflict_resolution.auto_resolve_strategy),
                 );
-                println!(
-                    "Backup on conflict: {}",
-                    config.conflict_resolution.backup_on_conflict
+                ui::print_config_item(
+                    "Backup on conflict",
+                    &config.conflict_resolution.backup_on_conflict.to_string(),
                 );
-                println!(
-                    "Prompt before force-push: {}",
-                    config.conflict_resolution.prompt_before_force_push
+                ui::print_config_item(
+                    "Prompt before force-push",
+                    &config
+                        .conflict_resolution
+                        .prompt_before_force_push
+                        .to_string(),
                 );
-                println!(
-                    "Auto force-push after rebase: {}",
-                    config.conflict_resolution.auto_force_push_after_rebase
+                ui::print_config_item(
+                    "Auto force-push after rebase",
+                    &config
+                        .conflict_resolution
+                        .auto_force_push_after_rebase
+                        .to_string(),
                 );
-                println!("Auto-stash: {}", config.git.auto_stash);
-                println!(
-                    "Default rebase strategy: {:?}",
-                    config.git.default_rebase_strategy
+                ui::print_config_item("Auto-stash", &config.git.auto_stash.to_string());
+                ui::print_config_item(
+                    "Default rebase strategy",
+                    &format!("{:?}", config.git.default_rebase_strategy),
                 );
             }
             ConfigCommands::Setup => {
@@ -113,7 +121,7 @@ impl AppContext {
                     "simple" => AutoResolveStrategy::Simple,
                     "smart" => AutoResolveStrategy::Smart,
                     _ => {
-                        eprintln!("Invalid strategy. Use 'never', 'simple', or 'smart'");
+                        ui::print_error("Invalid strategy. Use 'never', 'simple', or 'smart'");
                         return Ok(());
                     }
                 };
@@ -122,7 +130,7 @@ impl AppContext {
                     config.conflict_resolution.auto_resolve_strategy = new_strategy;
                 })?;
 
-                utils::print_success(&format!(
+                ui::print_success(&format!(
                     "Set conflict resolution strategy to: {}",
                     strategy
                 ));
@@ -133,7 +141,7 @@ impl AppContext {
                     "prompt" => (false, true),
                     "never" => (false, false),
                     _ => {
-                        eprintln!("Invalid mode. Use 'auto', 'prompt', or 'never'");
+                        ui::print_error("Invalid mode. Use 'auto', 'prompt', or 'never'");
                         return Ok(());
                     }
                 };
@@ -143,12 +151,18 @@ impl AppContext {
                     config.conflict_resolution.prompt_before_force_push = prompt_before;
                 })?;
 
-                utils::print_success(&format!("Set force-push behavior to: {}", mode));
+                ui::print_success(&format!("Set force-push behavior to: {}", mode));
 
-                 match mode.as_str() {
-                    "auto" => utils::print_info("Branches will be automatically force-pushed after rebase (with --force-with-lease for safety)"),
-                    "prompt" => utils::print_info("You will be prompted before force-pushing branches after rebase"),
-                    "never" => utils::print_info("Force-push will be skipped, manual intervention required after rebase"),
+                match mode.as_str() {
+                    "auto" => ui::print_info(
+                        "Branches will be automatically force-pushed after rebase (with --force-with-lease for safety)",
+                    ),
+                    "prompt" => ui::print_info(
+                        "You will be prompted before force-pushing branches after rebase",
+                    ),
+                    "never" => ui::print_info(
+                        "Force-push will be skipped, manual intervention required after rebase",
+                    ),
                     _ => {}
                 }
             }
@@ -158,7 +172,7 @@ impl AppContext {
 
     /// Handle the health check command.
     async fn handle_health_command(stack_manager: &mut StackManager) -> Result<()> {
-        utils::print_train_header("Repository Health Check");
+        ui::print_train_header("Repository Health Check");
 
         {
             let conflict_resolver = stack_manager.get_conflict_resolver();
@@ -167,27 +181,27 @@ impl AppContext {
             // Check git state
             match git_state {
                 crate::conflict::GitState::Clean => {
-                    utils::print_success("✅ Git repository is in a clean state");
+                    ui::print_success("✅ Git repository is in a clean state");
                 }
                 state => {
-                    utils::print_warning(&format!("⚠️ Git repository is in state: {:?}", state));
+                    ui::print_warning(&format!("⚠️ Git repository is in state: {:?}", state));
 
                     // Check for conflicts
                     if let Some(conflicts) = conflict_resolver.detect_conflicts()? {
-                        utils::print_error(&format!(
+                        ui::print_error(&format!(
                             "❌ Found {} conflicted files:",
                             conflicts.files.len()
                         ));
                         conflict_resolver.print_conflict_summary(&conflicts);
 
-                        utils::print_info("Recovery options:");
-                        utils::print_info(
+                        ui::print_info("Recovery options:");
+                        ui::print_info(
                             "• Run 'git-train sync' to continue with integrated conflict resolution",
                         );
-                        utils::print_info("• Run 'git-train health' to check current state");
+                        ui::print_info("• Run 'git-train health' to check current state");
                     } else {
-                        utils::print_info("No conflicts detected, but repository needs attention");
-                        utils::print_info("Try running: git-train sync");
+                        ui::print_info("No conflicts detected, but repository needs attention");
+                        ui::print_info("Try running: git-train sync");
                     }
                 }
             }
@@ -196,35 +210,35 @@ impl AppContext {
         // Check for stack
         match stack_manager.get_or_load_current_stack() {
             Ok(stack) => {
-                utils::print_success(&format!("✅ Stack '{}' is available", stack.name));
+                ui::print_success(&format!("✅ Stack '{}' is available", stack.name));
 
                 // Check working directory
                 let has_changes = stack_manager.has_uncommitted_changes().unwrap_or(false);
                 if has_changes {
-                    utils::print_info("📝 Working directory has uncommitted changes");
+                    ui::print_info("📝 Working directory has uncommitted changes");
                 } else {
-                    utils::print_success("✅ Working directory is clean");
+                    ui::print_success("✅ Working directory is clean");
                 }
 
                 // Check current branch
                 if let Ok(current_branch) = stack_manager.get_current_branch() {
                     if stack.branches.contains_key(&current_branch) {
-                        utils::print_success(&format!(
+                        ui::print_success(&format!(
                             "✅ Current branch '{}' is part of the stack",
                             current_branch
                         ));
                     } else {
-                        utils::print_warning(&format!(
+                        ui::print_warning(&format!(
                             "⚠️ Current branch '{}' is not part of the stack",
                             current_branch
                         ));
-                        utils::print_info("You can add it with: git-train add");
+                        ui::print_info("You can add it with: git-train add");
                     }
                 }
             }
             Err(_) => {
-                utils::print_warning("⚠️ No active stack found");
-                utils::print_info("Create a new stack with: git-train create <name>");
+                ui::print_warning("⚠️ No active stack found");
+                ui::print_info("Create a new stack with: git-train create <name>");
             }
         }
 
@@ -233,10 +247,10 @@ impl AppContext {
         let git_state_check = stack_manager.get_conflict_resolver().get_git_state()?;
         match git_state_check {
             crate::conflict::GitState::Clean => {
-                utils::print_success("🎉 Repository is healthy and ready for git-train operations");
+                ui::print_success("🎉 Repository is healthy and ready for git-train operations");
             }
             _ => {
-                utils::print_warning(
+                ui::print_warning(
                     "🔧 Repository needs attention before git-train operations can proceed safely",
                 );
             }
@@ -244,4 +258,4 @@ impl AppContext {
 
         Ok(())
     }
-} 
+}

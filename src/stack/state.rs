@@ -79,7 +79,9 @@ impl StackState {
         for entry in fs::read_dir(&self.train_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "json") && path.file_stem().map_or(false, |s| s != "current") {
+            if path.extension().is_some_and(|e| e == "json")
+                && path.file_stem().is_some_and(|s| s != "current")
+            {
                 if let Ok(stack_json) = fs::read_to_string(&path) {
                     if let Ok(stack) = serde_json::from_str::<Stack>(&stack_json) {
                         stacks.push(stack);
@@ -121,4 +123,4 @@ impl StackState {
         let current_file = self.train_dir.join("current.json");
         Ok(fs::read_to_string(current_file).unwrap_or_default())
     }
-} 
+}

@@ -5,9 +5,7 @@ use std::process::Command;
 use crate::config::TrainConfig;
 use crate::errors::TrainError;
 use crate::git::GitRepository;
-use crate::utils::{
-    confirm_action, print_error, print_info, print_success, print_warning,
-};
+use crate::ui;
 
 #[derive(Debug, Clone)]
 pub struct ConflictInfo {
@@ -82,7 +80,7 @@ impl ConflictResolver {
                 return Ok(GitState::Rebasing);
             } else {
                 // Clean up stale rebase files
-                print_info("Detected stale rebase state files, cleaning up...");
+                ui::print_info("Detected stale rebase state files, cleaning up...");
                 self.cleanup_stale_rebase_files()?;
             }
         }
@@ -92,7 +90,7 @@ impl ConflictResolver {
             if self.is_merge_actually_active()? {
                 return Ok(GitState::Merging);
             } else {
-                print_info("Detected stale merge state files, cleaning up...");
+                ui::print_info("Detected stale merge state files, cleaning up...");
                 self.cleanup_stale_merge_files()?;
             }
         }
@@ -102,7 +100,7 @@ impl ConflictResolver {
             if self.is_cherry_pick_actually_active()? {
                 return Ok(GitState::CherryPicking);
             } else {
-                print_info("Detected stale cherry-pick state files, cleaning up...");
+                ui::print_info("Detected stale cherry-pick state files, cleaning up...");
                 self.cleanup_stale_cherry_pick_files()?;
             }
         }
@@ -133,7 +131,10 @@ impl ConflictResolver {
     /// Check if a cherry-pick is actually in progress
     fn is_cherry_pick_actually_active(&self) -> Result<bool> {
         // Try to continue cherry-pick to see if it's actually in progress
-        match self.git_repo.run(&["cherry-pick", "--continue", "--dry-run"]) {
+        match self
+            .git_repo
+            .run(&["cherry-pick", "--continue", "--dry-run"])
+        {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
         }
@@ -151,9 +152,9 @@ impl ConflictResolver {
             let file_path = git_dir.join(file);
             if file_path.exists() {
                 if let Err(e) = std::fs::remove_file(&file_path) {
-                    print_warning(&format!("Could not remove stale file {}: {}", file, e));
+                    ui::print_warning(&format!("Could not remove stale file {}: {}", file, e));
                 } else {
-                    print_info(&format!("Removed stale file: {}", file));
+                    ui::print_info(&format!("Removed stale file: {}", file));
                 }
             }
         }
@@ -164,9 +165,9 @@ impl ConflictResolver {
             let dir_path = git_dir.join(dir);
             if dir_path.exists() {
                 if let Err(e) = std::fs::remove_dir_all(&dir_path) {
-                    print_warning(&format!("Could not remove stale directory {}: {}", dir, e));
+                    ui::print_warning(&format!("Could not remove stale directory {}: {}", dir, e));
                 } else {
-                    print_info(&format!("Removed stale directory: {}", dir));
+                    ui::print_info(&format!("Removed stale directory: {}", dir));
                 }
             }
         }
@@ -183,9 +184,9 @@ impl ConflictResolver {
             let file_path = git_dir.join(file);
             if file_path.exists() {
                 if let Err(e) = std::fs::remove_file(&file_path) {
-                    print_warning(&format!("Could not remove stale file {}: {}", file, e));
+                    ui::print_warning(&format!("Could not remove stale file {}: {}", file, e));
                 } else {
-                    print_info(&format!("Removed stale file: {}", file));
+                    ui::print_info(&format!("Removed stale file: {}", file));
                 }
             }
         }
@@ -202,9 +203,9 @@ impl ConflictResolver {
             let file_path = git_dir.join(file);
             if file_path.exists() {
                 if let Err(e) = std::fs::remove_file(&file_path) {
-                    print_warning(&format!("Could not remove stale file {}: {}", file, e));
+                    ui::print_warning(&format!("Could not remove stale file {}: {}", file, e));
                 } else {
-                    print_info(&format!("Removed stale file: {}", file));
+                    ui::print_info(&format!("Removed stale file: {}", file));
                 }
             }
         }
@@ -227,7 +228,7 @@ impl ConflictResolver {
 
     /// Attempt to resolve conflicts automatically based on configuration
     pub async fn auto_resolve_conflicts(&self, _conflict_info: &ConflictInfo) -> Result<bool> {
-        print_info("Automatic conflict resolution is disabled");
+        ui::print_info("Automatic conflict resolution is disabled");
         Ok(false)
     }
 
@@ -236,7 +237,7 @@ impl ConflictResolver {
         &self,
         conflict_info: &ConflictInfo,
     ) -> Result<()> {
-        print_info("Conflicts detected. Manual resolution required.");
+        ui::print_info("Conflicts detected. Manual resolution required.");
 
         // Show conflict summary
         self.print_conflict_summary(conflict_info);
@@ -247,29 +248,27 @@ impl ConflictResolver {
             "Abort current operation",
         ];
 
-        let choice = match crate::utils::select_from_list(
-            &options,
-            "How would you like to resolve the conflicts?",
-        ) {
-            Ok(choice) => choice,
-            Err(_) => {
-                // User cancelled (Ctrl+C) - provide graceful handling
-                print_warning("Operation cancelled by user.");
-                print_info("Resolution options:");
-                print_info("• Re-run 'git-train sync' to try conflict resolution again");
-                print_info("• Resolve conflicts manually and re-run 'git-train sync'");
-                return Err(TrainError::InvalidState {
-                    message: "Conflict resolution cancelled by user".to_string(),
+        let choice =
+            match ui::select_from_list(&options, "How would you like to resolve the conflicts?") {
+                Ok(choice) => choice,
+                Err(_) => {
+                    // User cancelled (Ctrl+C) - provide graceful handling
+                    ui::print_warning("Operation cancelled by user.");
+                    ui::print_info("Resolution options:");
+                    ui::print_info("• Re-run 'git-train sync' to try conflict resolution again");
+                    ui::print_info("• Resolve conflicts manually and re-run 'git-train sync'");
+                    return Err(TrainError::InvalidState {
+                        message: "Conflict resolution cancelled by user".to_string(),
+                    }
+                    .into());
                 }
-                .into());
-            }
-        };
+            };
 
         match choice {
             0 => self.open_editor_for_conflicts(conflict_info).await,
             1 => {
                 self.abort_current_operation()?;
-                print_success("Current operation aborted. Repository is now clean.");
+                ui::print_success("Current operation aborted. Repository is now clean.");
                 Ok(())
             }
             _ => unreachable!(),
@@ -280,10 +279,10 @@ impl ConflictResolver {
     async fn open_editor_for_conflicts(&self, conflict_info: &ConflictInfo) -> Result<()> {
         let editor_config = &self.config.editor;
 
-        print_info("Opening editor(s) to resolve conflicts...");
+        ui::print_info("Opening editor(s) to resolve conflicts...");
 
         for conflict_file in &conflict_info.files {
-            print_info(&format!(
+            ui::print_info(&format!(
                 "Opening {} in {}",
                 conflict_file.path, editor_config.default_editor
             ));
@@ -295,7 +294,7 @@ impl ConflictResolver {
             match cmd.status() {
                 Ok(status) => {
                     if !status.success() {
-                        print_warning(&format!(
+                        ui::print_warning(&format!(
                             "Editor {} exited with non-zero status",
                             editor_config.default_editor
                         ));
@@ -303,9 +302,9 @@ impl ConflictResolver {
                         // Check if user wants to continue with other files or abort
                         if conflict_info.files.len() > 1 {
                             let continue_choice =
-                                crate::utils::confirm_action("Continue editing other files?")?;
+                                ui::confirm_action("Continue editing other files?")?;
                             if !continue_choice {
-                                print_info("Please resolve conflicts manually and re-run 'git-train sync' when ready.");
+                                ui::print_info("Please resolve conflicts manually and re-run 'git-train sync' when ready.");
                                 return Err(TrainError::InvalidState {
                                     message: "Manual conflict resolution interrupted".to_string(),
                                 }
@@ -315,13 +314,13 @@ impl ConflictResolver {
                     }
                 }
                 Err(e) => {
-                    print_error(&format!(
+                    ui::print_error(&format!(
                         "Failed to launch editor {}: {}",
                         editor_config.default_editor, e
                     ));
-                    print_info("You can:");
-                    print_info("• Resolve conflicts manually in your preferred editor");
-                    print_info("• Re-run 'git-train sync' when done");
+                    ui::print_info("You can:");
+                    ui::print_info("• Resolve conflicts manually in your preferred editor");
+                    ui::print_info("• Re-run 'git-train sync' when done");
                     return Err(TrainError::GitError {
                         message: format!("Could not launch editor: {}", e),
                     }
@@ -331,12 +330,12 @@ impl ConflictResolver {
         }
 
         // Wait for user confirmation that they've finished resolving conflicts
-        print_info("");
-        print_success("Editor(s) have been opened for conflict resolution.");
-        print_info("After resolving all conflicts in your editor(s), come back here.");
+        ui::print_info("");
+        ui::print_success("Editor(s) have been opened for conflict resolution.");
+        ui::print_info("After resolving all conflicts in your editor(s), come back here.");
 
         // Simple confirmation prompt
-        println!("Press Enter when you have finished resolving all conflicts...");
+        ui::print_info("Press Enter when you have finished resolving all conflicts...");
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
 
@@ -349,12 +348,12 @@ impl ConflictResolver {
         let current_conflicts = self.detect_conflicts()?;
 
         if let Some(conflicts) = current_conflicts {
-            print_error(&format!(
+            ui::print_error(&format!(
                 "Still have {} unresolved conflicts",
                 conflicts.files.len()
             ));
 
-            if confirm_action("Do you want to continue editing?")? {
+            if ui::confirm_action("Do you want to continue editing?")? {
                 return Box::pin(self.open_editor_for_conflicts(&conflicts)).await;
             } else {
                 return Err(TrainError::InvalidState {
@@ -370,18 +369,18 @@ impl ConflictResolver {
         match self.get_git_state()? {
             GitState::Rebasing => {
                 self.git_repo.run(&["rebase", "--continue"])?;
-                print_success("Rebase continued successfully");
+                ui::print_success("Rebase continued successfully");
             }
             GitState::Merging => {
                 self.git_repo.run(&["commit", "--no-edit"])?;
-                print_success("Merge completed successfully");
+                ui::print_success("Merge completed successfully");
             }
             GitState::CherryPicking => {
                 self.git_repo.run(&["cherry-pick", "--continue"])?;
-                print_success("Cherry-pick continued successfully");
+                ui::print_success("Cherry-pick continued successfully");
             }
             _ => {
-                print_success("Conflicts resolved");
+                ui::print_success("Conflicts resolved");
             }
         }
 
@@ -431,34 +430,37 @@ impl ConflictResolver {
     }
 
     pub fn print_conflict_summary(&self, conflict_info: &ConflictInfo) {
-        print_warning(&format!(
+        ui::print_warning(&format!(
             "Found {} conflicted files:",
             conflict_info.files.len()
         ));
 
         for conflict_file in &conflict_info.files {
-            println!("  📄 {} ({:?})", conflict_file.path, conflict_file.status);
+            ui::print_info(&format!(
+                "  📄 {} ({:?})",
+                conflict_file.path, conflict_file.status
+            ));
         }
 
-        print_warning("Manual resolution required");
+        ui::print_warning("Manual resolution required");
     }
 
     pub fn abort_current_operation(&self) -> Result<()> {
         match self.get_git_state()? {
             GitState::Rebasing => {
                 self.git_repo.run(&["rebase", "--abort"])?;
-                print_info("Rebase aborted");
+                ui::print_info("Rebase aborted");
             }
             GitState::Merging => {
                 self.git_repo.run(&["merge", "--abort"])?;
-                print_info("Merge aborted");
+                ui::print_info("Merge aborted");
             }
             GitState::CherryPicking => {
                 self.git_repo.run(&["cherry-pick", "--abort"])?;
-                print_info("Cherry-pick aborted");
+                ui::print_info("Cherry-pick aborted");
             }
             _ => {
-                print_warning("No operation to abort");
+                ui::print_warning("No operation to abort");
             }
         }
         Ok(())
