@@ -159,7 +159,7 @@ impl StackManager {
     pub async fn save_changes(&mut self, message: &str) -> Result<()> {
         print_train_header("Saving Changes");
 
-        let stack = self.get_current_stack()?;
+        let stack = self.load_current_stack()?;
         let current_branch = self.get_current_branch()?;
 
         // Ensure the current branch is part of the stack
@@ -210,7 +210,7 @@ impl StackManager {
     pub async fn amend_changes(&mut self, new_message: Option<&str>) -> Result<()> {
         print_train_header("Amending Changes");
 
-        let stack = self.get_current_stack()?;
+        let stack = self.load_current_stack()?;
         let current_branch = self.get_current_branch()?;
 
         // Ensure the current branch is part of the stack
@@ -272,7 +272,7 @@ impl StackManager {
     pub async fn add_branch_to_stack(&mut self, parent: Option<&str>) -> Result<()> {
         print_train_header("Adding Branch to Stack");
 
-        let mut stack = self.get_current_stack()?;
+        let mut stack = self.load_current_stack()?;
         let current_branch = self.get_current_branch()?;
 
         // Check if branch is already in the stack
@@ -625,15 +625,6 @@ impl StackManager {
         print_success("Stack synchronized with remote");
 
         Ok(())
-    }
-
-    // Helper methods
-    fn get_current_stack(&self) -> Result<Stack> {
-        self.current_stack.clone().ok_or_else(|| {
-            TrainError::StackError {
-                message: "No active stack. Create a stack first with 'git-train create <name>'".to_string(),
-            }.into()
-        })
     }
 
     fn get_current_branch(&self) -> Result<String> {
