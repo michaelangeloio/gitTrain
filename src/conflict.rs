@@ -237,7 +237,7 @@ impl ConflictResolver {
 
         // Ask user how they want to proceed
         let options = vec![
-            "Open editor to resolve conflicts manually",
+            "Open editor to resolve conflicts manually and continue when ready",
             "Abort current operation",
         ];
 
@@ -250,9 +250,8 @@ impl ConflictResolver {
                 // User cancelled (Ctrl+C) - provide graceful handling
                 print_warning("Operation cancelled by user.");
                 print_info("Resolution options:");
-                print_info("• Run 'git-train resolve interactive' to try again");
-                print_info("• Run 'git-train resolve abort' to cancel the current operation");
-                print_info("• Resolve conflicts manually and run 'git-train resolve continue'");
+                print_info("• Re-run 'git-train sync' to try conflict resolution again");
+                print_info("• Resolve conflicts manually and re-run 'git-train sync'");
                 return Err(TrainError::InvalidState {
                     message: "Conflict resolution cancelled by user".to_string(),
                 }
@@ -274,6 +273,8 @@ impl ConflictResolver {
     /// Open the configured editor for manual conflict resolution
     async fn open_editor_for_conflicts(&self, conflict_info: &ConflictInfo) -> Result<()> {
         let editor_config = &self.config.editor;
+
+        print_info("Opening editor(s) to resolve conflicts...");
 
         for conflict_file in &conflict_info.files {
             print_info(&format!(
@@ -298,13 +299,7 @@ impl ConflictResolver {
                             let continue_choice =
                                 crate::utils::confirm_action("Continue editing other files?")?;
                             if !continue_choice {
-                                print_info("Resolution options:");
-                                print_info(
-                                    "• Run 'git-train resolve interactive' to resume editing",
-                                );
-                                print_info(
-                                    "• Run 'git-train resolve abort' to cancel the operation",
-                                );
+                                print_info("Please resolve conflicts manually and re-run 'git-train sync' when ready.");
                                 return Err(TrainError::InvalidState {
                                     message: "Manual conflict resolution interrupted".to_string(),
                                 }
@@ -320,8 +315,7 @@ impl ConflictResolver {
                     ));
                     print_info("You can:");
                     print_info("• Resolve conflicts manually in your preferred editor");
-                    print_info("• Run 'git-train resolve continue' when done");
-                    print_info("• Run 'git-train resolve abort' to cancel");
+                    print_info("• Re-run 'git-train sync' when done");
                     return Err(TrainError::GitError {
                         message: format!("Could not launch editor: {}", e),
                     }
@@ -329,6 +323,16 @@ impl ConflictResolver {
                 }
             }
         }
+
+        // Wait for user confirmation that they've finished resolving conflicts
+        print_info("");
+        print_success("Editor(s) have been opened for conflict resolution.");
+        print_info("After resolving all conflicts in your editor(s), come back here.");
+
+        // Simple confirmation prompt
+        println!("Press Enter when you have finished resolving all conflicts...");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
 
         // Verify conflicts are resolved
         self.verify_conflicts_resolved().await
@@ -451,20 +455,6 @@ impl ConflictResolver {
                 print_warning("No operation to abort");
             }
         }
-        Ok(())
-    }
-
-    /// Force cleanup of all stale git state files
-    pub fn cleanup_all_stale_files(&self) -> Result<()> {
-        print_info("Cleaning up all potentially stale git state files...");
-
-        // Clean up stale files even if we think they're active
-        // This is a force cleanup for recovery scenarios
-        self.cleanup_stale_rebase_files()?;
-        self.cleanup_stale_merge_files()?;
-        self.cleanup_stale_cherry_pick_files()?;
-
-        print_success("Cleaned up all stale git state files");
         Ok(())
     }
 }

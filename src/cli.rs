@@ -70,10 +70,6 @@ pub enum Commands {
     #[command(subcommand)]
     Config(ConfigCommands),
 
-    /// Conflict resolution commands
-    #[command(subcommand)]
-    Resolve(ResolveCommands),
-
     /// Check repository and stack health
     Health,
 }
@@ -103,28 +99,4 @@ pub enum ConfigCommands {
         /// Mode: 'auto', 'prompt', or 'never'
         mode: String,
     },
-}
-
-#[derive(Subcommand)]
-pub enum ResolveCommands {
-    /// Check for conflicts in current repository
-    Check,
-
-    /// Resolve conflicts interactively
-    Interactive,
-
-    /// Attempt automatic conflict resolution
-    Auto,
-
-    /// Abort current git operation
-    Abort,
-
-    /// Continue after resolving conflicts manually
-    Continue,
-
-    /// Attempt to recover from interrupted git operations
-    Recover,
-
-    /// Force cleanup of all stale git state files
-    Cleanup,
 }

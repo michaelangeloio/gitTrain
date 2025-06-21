@@ -92,7 +92,7 @@ impl StackManager {
         let git_state = self.conflict_resolver.get_git_state()?;
         if !matches!(git_state, GitState::Clean) {
             return Err(TrainError::InvalidState {
-                message: format!("Cannot rebase: git is in state {:?}. Use 'git-train resolve continue' or 'git-train resolve abort' first.", git_state),
+                message: format!("Cannot rebase: git is in state {:?}. Please run 'git-train sync' to handle conflicts.", git_state),
             }.into());
         }
 
@@ -135,10 +135,7 @@ impl StackManager {
                                     "Auto-resolution disabled. Please resolve conflicts manually:",
                                 );
                                 print_info(
-                                    "Run 'git-train resolve interactive' to resolve conflicts",
-                                );
-                                print_info(
-                                    "Then run 'git-train resolve continue' to complete the rebase",
+                                    "Re-run 'git-train sync' to continue with manual conflict resolution",
                                 );
                                 Err(TrainError::InvalidState {
                                     message: format!("Manual conflict resolution required for rebase of {} onto {}", branch, onto),
@@ -159,12 +156,9 @@ impl StackManager {
                                         ));
                                         print_info("Resolution options:");
                                         print_info(
-                                            "• Run 'git-train resolve interactive' to try again",
+                                            "• Re-run 'git-train sync' to try conflict resolution again",
                                         );
-                                        print_info(
-                                            "• Run 'git-train resolve abort' to cancel the rebase",
-                                        );
-                                        print_info("• Resolve conflicts manually and run 'git-train resolve continue'");
+                                        print_info("• Resolve conflicts manually and re-run 'git-train sync'");
                                         Err(TrainError::InvalidState {
                                             message: format!(
                                                 "Rebase of {} onto {} requires manual intervention",
@@ -1178,7 +1172,7 @@ impl StackManager {
                             Ok(())
                         }
                         3 => {
-                            print_info("Resolution deferred. Use 'git-train resolve interactive' when ready.");
+                            print_info("Resolution deferred. Re-run 'git-train sync' when ready.");
                             Err(TrainError::InvalidState {
                                 message: "Manual conflict resolution deferred".to_string(),
                             }
@@ -1306,8 +1300,7 @@ impl StackManager {
         if let Err(e) = self.check_and_recover_git_state().await {
             print_error(&format!("Cannot sync: {}", e));
             print_info("Please resolve the git state issue first:");
-            print_info("• Use 'git-train resolve interactive' for conflict resolution");
-            print_info("• Use 'git-train resolve abort' to cancel interrupted operations");
+            print_info("• Conflicts will be handled during sync");
             return Err(e);
         }
 
@@ -1336,7 +1329,7 @@ impl StackManager {
             Err(e) => {
                 print_error(&format!("Some branches failed to rebase: {}", e));
                 print_info("You can:");
-                print_info("• Run 'git-train resolve interactive' to handle conflicts");
+                print_info("• Re-run 'git-train sync' to handle conflicts");
                 print_info("• Run 'git-train sync' again after resolving issues");
 
                 // Try to return to a safe state

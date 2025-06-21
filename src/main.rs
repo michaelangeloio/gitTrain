@@ -9,7 +9,7 @@ mod gitlab;
 mod stack;
 mod utils;
 
-use cli::{Cli, Commands, ConfigCommands, ResolveCommands};
+use cli::{Cli, Commands, ConfigCommands};
 use config::ConfigManager;
 use stack::StackManager;
 
@@ -67,9 +67,6 @@ async fn main() -> Result<()> {
         }
         Commands::Config(cmd) => {
             handle_config_commands(&cmd, &mut config_manager).await?;
-        }
-        Commands::Resolve(cmd) => {
-            handle_resolve_commands(&cmd, &mut stack_manager).await?;
         }
         Commands::Health => {
             handle_health_command(&mut stack_manager).await?;
@@ -169,78 +166,6 @@ async fn handle_config_commands(
     Ok(())
 }
 
-async fn handle_resolve_commands(
-    cmd: &ResolveCommands,
-    stack_manager: &mut StackManager,
-) -> Result<()> {
-    let conflict_resolver = stack_manager.get_conflict_resolver();
-
-    match cmd {
-        ResolveCommands::Check => {
-            if let Some(conflicts) = conflict_resolver.detect_conflicts()? {
-                utils::print_warning(&format!(
-                    "Found conflicts in {} files",
-                    conflicts.files.len()
-                ));
-                conflict_resolver.print_conflict_summary(&conflicts);
-            } else {
-                utils::print_success("No conflicts detected");
-            }
-        }
-        ResolveCommands::Interactive => {
-            if let Some(conflicts) = conflict_resolver.detect_conflicts()? {
-                conflict_resolver
-                    .resolve_conflicts_interactively(&conflicts)
-                    .await?;
-            } else {
-                utils::print_info("No conflicts to resolve");
-            }
-        }
-        ResolveCommands::Auto => {
-            if let Some(conflicts) = conflict_resolver.detect_conflicts()? {
-                if conflict_resolver.auto_resolve_conflicts(&conflicts).await? {
-                    utils::print_success("Conflicts resolved automatically");
-                } else {
-                    utils::print_warning("Could not resolve all conflicts automatically");
-                }
-            } else {
-                utils::print_info("No conflicts to resolve");
-            }
-        }
-        ResolveCommands::Abort => {
-            conflict_resolver.abort_current_operation()?;
-        }
-        ResolveCommands::Continue => {
-            // This is primarily for resuming after manual resolution
-            conflict_resolver.verify_conflicts_resolved().await?;
-        }
-        ResolveCommands::Recover => {
-            // Use the new recovery functionality from StackManager
-            match stack_manager.check_and_recover_git_state().await {
-                Ok(_) => utils::print_success("Repository state recovered successfully"),
-                Err(e) => {
-                    utils::print_error(&format!("Could not fully recover repository state: {}", e));
-                    utils::print_info("You may need to:");
-                    utils::print_info(
-                        "• Use 'git-train resolve interactive' for manual conflict resolution",
-                    );
-                    utils::print_info(
-                        "• Use 'git-train resolve abort' to cancel interrupted operations",
-                    );
-                }
-            }
-        }
-        ResolveCommands::Cleanup => {
-            // Force cleanup all stale git state files
-            conflict_resolver.cleanup_all_stale_files()?;
-            utils::print_info("If the repository is still in an inconsistent state, you can:");
-            utils::print_info("• Run 'git-train health' to check repository status");
-            utils::print_info("• Run 'git-train resolve recover' for automatic recovery");
-        }
-    }
-    Ok(())
-}
-
 async fn handle_health_command(stack_manager: &mut StackManager) -> Result<()> {
     utils::print_train_header("Repository Health Check");
 
@@ -264,16 +189,13 @@ async fn handle_health_command(stack_manager: &mut StackManager) -> Result<()> {
                 conflict_resolver.print_conflict_summary(&conflicts);
 
                 utils::print_info("Recovery options:");
-                utils::print_info("• Run 'git-train resolve recover' for automatic recovery");
                 utils::print_info(
-                    "• Run 'git-train resolve interactive' for manual conflict resolution",
+                    "• Run 'git-train sync' to continue with integrated conflict resolution",
                 );
-                utils::print_info(
-                    "• Run 'git-train resolve abort' to cancel interrupted operations",
-                );
+                utils::print_info("• Run 'git-train health' to check current state");
             } else {
                 utils::print_info("No conflicts detected, but repository needs attention");
-                utils::print_info("Try running: git-train resolve recover");
+                utils::print_info("Try running: git-train sync");
             }
         }
     }

@@ -76,7 +76,9 @@ pub fn create_navigation_options(
 
     // Add section separator
     options.push(NavigationOption {
-        display: style("── BRANCHES ────────────────────────────────").dim().to_string(),
+        display: style("── BRANCHES ────────────────────────────────")
+            .dim()
+            .to_string(),
         action: NavigationAction::RefreshStatus, // Dummy action
     });
 
@@ -105,7 +107,11 @@ pub fn create_navigation_options(
             "{} {} {}{}",
             styled_symbol,
             style(branch).bold(),
-            if is_current { style(" (current)").dim() } else { style("") },
+            if is_current {
+                style(" (current)").dim()
+            } else {
+                style("")
+            },
             style(&mr_info).dim()
         );
 
@@ -117,7 +123,9 @@ pub fn create_navigation_options(
 
     // Add section separator for actions
     options.push(NavigationOption {
-        display: style("── ACTIONS ─────────────────────────────────").dim().to_string(),
+        display: style("── ACTIONS ─────────────────────────────────")
+            .dim()
+            .to_string(),
         action: NavigationAction::RefreshStatus, // Dummy action
     });
 
@@ -126,7 +134,8 @@ pub fn create_navigation_options(
         if branches.contains(&current.to_string()) {
             // Show info action for current branch
             options.push(NavigationOption {
-                display: format!("  {} Show info for {}", 
+                display: format!(
+                    "  {} Show info for {}",
                     style("ℹ").blue(),
                     style(current).bold()
                 ),
@@ -136,7 +145,8 @@ pub fn create_navigation_options(
             // MR action for current branch
             if let Some(mr_status) = branch_mr_status.get(current) {
                 options.push(NavigationOption {
-                    display: format!("  {} View MR !{} for {}", 
+                    display: format!(
+                        "  {} View MR !{} for {}",
                         style("→").green(),
                         mr_status.iid,
                         style(current).bold()
@@ -145,7 +155,8 @@ pub fn create_navigation_options(
                 });
             } else {
                 options.push(NavigationOption {
-                    display: format!("  {} Create MR for {}", 
+                    display: format!(
+                        "  {} Create MR for {}",
                         style("+").green(),
                         style(current).bold()
                     ),
@@ -162,7 +173,8 @@ pub fn create_navigation_options(
         }
 
         options.push(NavigationOption {
-            display: format!("  {} Show info for {}", 
+            display: format!(
+                "  {} Show info for {}",
                 style("ℹ").blue().dim(),
                 style(branch).dim()
             ),
@@ -171,7 +183,8 @@ pub fn create_navigation_options(
 
         if let Some(mr_status) = branch_mr_status.get(branch) {
             options.push(NavigationOption {
-                display: format!("  {} View MR !{} for {}", 
+                display: format!(
+                    "  {} View MR !{} for {}",
                     style("→").green().dim(),
                     mr_status.iid,
                     style(branch).dim()
@@ -180,7 +193,8 @@ pub fn create_navigation_options(
             });
         } else {
             options.push(NavigationOption {
-                display: format!("  {} Create MR for {}", 
+                display: format!(
+                    "  {} Create MR for {}",
                     style("+").green().dim(),
                     style(branch).dim()
                 ),
@@ -191,7 +205,9 @@ pub fn create_navigation_options(
 
     // Add final section separator
     options.push(NavigationOption {
-        display: style("── UTILITIES ───────────────────────────────").dim().to_string(),
+        display: style("── UTILITIES ───────────────────────────────")
+            .dim()
+            .to_string(),
         action: NavigationAction::RefreshStatus, // Dummy action
     });
 
@@ -245,7 +261,7 @@ pub fn print_train_header(title: &str) {
     let border = "═".repeat(border_width);
 
     println!("{}", style(&border).bold().cyan());
-    
+
     // Center the title with train symbols
     let title_content = format!(" ▶ {} ◀ ", title);
     let padding = if border_width > title_content.len() {
@@ -255,7 +271,7 @@ pub fn print_train_header(title: &str) {
     };
     let left_pad = " ".repeat(padding);
     let right_pad = " ".repeat(border_width.saturating_sub(title_content.len() + padding));
-    
+
     println!(
         "{}{}{}{}{}",
         style("║").bold().cyan(),
