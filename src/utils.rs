@@ -76,18 +76,30 @@ impl std::fmt::Display for NavigationOption {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct MrStatusInfo {
+    pub iid: u64,
+    pub state: String,
+}
+
 pub fn create_navigation_options(
     branches: &[String], 
     current_branch: Option<&str>,
-    branch_mrs: &std::collections::HashMap<String, u64>
+    branch_mr_status: &std::collections::HashMap<String, MrStatusInfo>
 ) -> Vec<NavigationOption> {
     let mut options = Vec::new();
     
     // Add branch navigation options
     for branch in branches {
         let is_current = current_branch.map_or(false, |current| current == branch);
-        let mr_info = if let Some(mr_iid) = branch_mrs.get(branch) {
-            format!(" [MR !{}]", mr_iid)
+        let mr_info = if let Some(mr_status) = branch_mr_status.get(branch) {
+            let (status_icon, status_text, priority_indicator) = match mr_status.state.as_str() {
+                "merged" => ("✅", "MERGED".to_string(), " 🎉"),
+                "closed" => ("❌", "CLOSED".to_string(), ""),
+                "opened" => ("🔄", "OPEN".to_string(), " 🚀"),
+                _ => ("❓", mr_status.state.to_uppercase(), ""),
+            };
+            format!(" [MR !{} {} {}{}]", mr_status.iid, status_icon, status_text, priority_indicator)
         } else {
             String::new()
         };
@@ -109,10 +121,10 @@ pub fn create_navigation_options(
             action: NavigationAction::ShowBranchInfo(branch.clone()),
         });
         
-        if let Some(mr_iid) = branch_mrs.get(branch) {
+        if let Some(mr_status) = branch_mr_status.get(branch) {
             options.push(NavigationOption {
-                display: format!("  🔗 View MR !{} for {}", mr_iid, branch),
-                action: NavigationAction::ViewMR(branch.clone(), *mr_iid),
+                display: format!("  🔗 View MR !{} for {}", mr_status.iid, branch),
+                action: NavigationAction::ViewMR(branch.clone(), mr_status.iid),
             });
         } else {
             options.push(NavigationOption {

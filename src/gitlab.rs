@@ -1,6 +1,7 @@
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 use crate::errors::TrainError;
 use crate::utils::run_git_command;
 
@@ -55,8 +56,8 @@ pub struct GitLabClient {
     client: Client,
     base_url: String,
     token: String,
-    project_info: Option<ProjectInfo>,
-    project_details: Option<GitLabProject>,
+    project_info: RwLock<Option<ProjectInfo>>,
+    project_details: RwLock<Option<GitLabProject>>,
 }
 
 impl GitLabClient {
@@ -75,30 +76,44 @@ impl GitLabClient {
             client,
             base_url,
             token,
-            project_info: None,
-            project_details: None,
+            project_info: RwLock::new(None),
+            project_details: RwLock::new(None),
         })
     }
 
-    pub async fn detect_and_cache_project(&mut self) -> Result<&GitLabProject> {
-        // Return cached project if already available
-        if let Some(ref project) = self.project_details {
-            return Ok(project);
+    pub async fn detect_and_cache_project(&self) -> Result<GitLabProject> {
+        // Check if project is already cached
+        {
+            let project_details = self.project_details.read().await;
+            if let Some(ref project) = *project_details {
+                return Ok(project.clone());
+            }
         }
 
         // Try to auto-detect project from git remotes
         match self.detect_project_from_remotes().await {
             Ok((info, details)) => {
-                self.project_info = Some(info);
-                self.project_details = Some(details);
-                Ok(self.project_details.as_ref().unwrap())
+                // Cache both project info and details
+                {
+                    let mut project_info = self.project_info.write().await;
+                    *project_info = Some(info);
+                }
+                {
+                    let mut project_details = self.project_details.write().await;
+                    *project_details = Some(details.clone());
+                }
+                Ok(details)
             }
             Err(_) => {
                 // Fall back to environment variables if available
                 if let Ok(project_id) = std::env::var("GITLAB_PROJECT_ID") {
                     if let Ok(project_details) = Self::get_project_by_id(&self.base_url, &self.token, &self.client, &project_id).await {
-                        self.project_details = Some(project_details);
-                        return Ok(self.project_details.as_ref().unwrap());
+                        // Cache the project details
+                        {
+                            let mut cached_details = self.project_details.write().await;
+                            *cached_details = Some(project_details.clone());
+                        }
+                        return Ok(project_details);
                     }
                 }
                 
@@ -232,29 +247,32 @@ impl GitLabClient {
         }
     }
 
-    pub fn get_project_details(&self) -> Option<&GitLabProject> {
-        self.project_details.as_ref()
+    pub async fn get_project_details(&self) -> Option<GitLabProject> {
+        let project_details = self.project_details.read().await;
+        project_details.clone()
     }
 
-    pub fn get_project_id(&self) -> Option<String> {
-        self.project_details.as_ref().map(|p| p.id.to_string())
+    pub async fn get_project_id(&self) -> Option<String> {
+        let project_details = self.project_details.read().await;
+        project_details.as_ref().map(|p| p.id.to_string())
     }
 
-    fn get_project_id_for_api(&self) -> Result<String> {
-        // Try project details first, then fall back to environment variable
-        if let Some(project) = &self.project_details {
-            Ok(project.id.to_string())
-        } else if let Ok(project_id) = std::env::var("GITLAB_PROJECT_ID") {
-            Ok(project_id)
-        } else {
-            Err(TrainError::GitLabError {
-                message: "No GitLab project ID available. Either auto-detection failed or GITLAB_PROJECT_ID is not set".to_string(),
-            }.into())
+    async fn get_project_id_for_api(&self) -> Result<String> {
+        // Try to get cached project details first
+        {
+            let project_details = self.project_details.read().await;
+            if let Some(ref project) = *project_details {
+                return Ok(project.id.to_string());
+            }
         }
+        
+        // If not cached, detect and cache the project
+        let project = self.detect_and_cache_project().await?;
+        Ok(project.id.to_string())
     }
 
     pub async fn create_merge_request(&self, request: CreateMergeRequestRequest) -> Result<MergeRequest> {
-        let project_id = self.get_project_id_for_api()?;
+        let project_id = self.get_project_id_for_api().await?;
         let url = format!("{}/api/v4/projects/{}/merge_requests", self.base_url, project_id);
         
         let response = self.client
@@ -276,7 +294,7 @@ impl GitLabClient {
     }
 
     pub async fn get_merge_requests(&self) -> Result<Vec<MergeRequest>> {
-        let project_id = self.get_project_id_for_api()?;
+        let project_id = self.get_project_id_for_api().await?;
         let url = format!("{}/api/v4/projects/{}/merge_requests", self.base_url, project_id);
         
         let response = self.client
@@ -298,7 +316,7 @@ impl GitLabClient {
     }
 
     pub async fn update_merge_request(&self, iid: u64, title: Option<String>, description: Option<String>) -> Result<MergeRequest> {
-        let project_id = self.get_project_id_for_api()?;
+        let project_id = self.get_project_id_for_api().await?;
         let url = format!("{}/api/v4/projects/{}/merge_requests/{}", self.base_url, project_id, iid);
         
         let mut params = serde_json::Map::new();
@@ -329,7 +347,7 @@ impl GitLabClient {
 
     /// Update merge request with optional target branch change
     pub async fn update_merge_request_with_target(&self, iid: u64, title: Option<String>, description: Option<String>, target_branch: Option<String>) -> Result<MergeRequest> {
-        let project_id = self.get_project_id_for_api()?;
+        let project_id = self.get_project_id_for_api().await?;
         let url = format!("{}/api/v4/projects/{}/merge_requests/{}", self.base_url, project_id, iid);
         
         let mut params = serde_json::Map::new();
@@ -363,7 +381,7 @@ impl GitLabClient {
 
     /// Get the current state of a merge request
     pub async fn get_merge_request(&self, iid: u64) -> Result<MergeRequest> {
-        let project_id = self.get_project_id_for_api()?;
+        let project_id = self.get_project_id_for_api().await?;
         let url = format!("{}/api/v4/projects/{}/merge_requests/{}", self.base_url, project_id, iid);
         
         let response = self.client

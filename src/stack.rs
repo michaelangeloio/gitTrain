@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::utils::{
     run_git_command, print_success, print_warning, print_error, print_info, 
     print_train_header, sanitize_branch_name, confirm_action, get_user_input,
-    create_backup_name, NavigationAction, create_navigation_options, interactive_stack_navigation
+    create_backup_name, NavigationAction, create_navigation_options, interactive_stack_navigation, MrStatusInfo
 };
 use crate::gitlab::{GitLabClient, CreateMergeRequestRequest, GitLabProject};
 use crate::errors::TrainError;
@@ -509,37 +509,7 @@ impl StackManager {
     pub async fn switch_stack(&mut self, stack_identifier: &str) -> Result<()> {
         print_train_header(&format!("Switching to Stack: {}", stack_identifier));
 
-        // Find the stack by name or ID
-        let stack_files = std::fs::read_dir(&self.train_dir)?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-                if path.extension()? == "json" && path.file_name()? != "current.json" {
-                    Some(path)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let mut target_stack: Option<Stack> = None;
-
-        for stack_file in stack_files {
-            if let Ok(stack_json) = std::fs::read_to_string(&stack_file) {
-                if let Ok(stack) = serde_json::from_str::<Stack>(&stack_json) {
-                    if stack.name == stack_identifier || stack.id.starts_with(stack_identifier) {
-                        target_stack = Some(stack);
-                        break;
-                    }
-                }
-            }
-        }
-
-        let stack = target_stack.ok_or_else(|| {
-            TrainError::StackError {
-                message: format!("Stack '{}' not found", stack_identifier),
-            }
-        })?;
+        let stack = self.find_stack_by_identifier(stack_identifier)?;
 
         // Update the current stack pointer
         let current_file = self.train_dir.join("current.json");
@@ -558,37 +528,8 @@ impl StackManager {
     pub async fn delete_stack(&mut self, stack_identifier: &str, force: bool) -> Result<()> {
         print_train_header(&format!("Deleting Stack: {}", stack_identifier));
 
-        // Find the stack by name or ID
-        let stack_files = std::fs::read_dir(&self.train_dir)?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-                if path.extension()? == "json" && path.file_name()? != "current.json" {
-                    Some(path)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let mut target_stack: Option<(Stack, PathBuf)> = None;
-
-        for stack_file in stack_files {
-            if let Ok(stack_json) = std::fs::read_to_string(&stack_file) {
-                if let Ok(stack) = serde_json::from_str::<Stack>(&stack_json) {
-                    if stack.name == stack_identifier || stack.id.starts_with(stack_identifier) {
-                        target_stack = Some((stack, stack_file));
-                        break;
-                    }
-                }
-            }
-        }
-
-        let (stack, stack_file) = target_stack.ok_or_else(|| {
-            TrainError::StackError {
-                message: format!("Stack '{}' not found", stack_identifier),
-            }
-        })?;
+        let stack = self.find_stack_by_identifier(stack_identifier)?;
+        let stack_file = self.train_dir.join(format!("{}.json", stack.id));
 
         // Check if this is the current stack
         let current_file = self.train_dir.join("current.json");
@@ -645,23 +586,8 @@ impl StackManager {
 
     pub async fn show_status(&mut self) -> Result<()> {
         print_train_header("Stack Status");
-
-        let stack = match &self.current_stack {
-            Some(stack) => stack,
-            None => &{
-                // Try to load existing stack
-                match self.load_current_stack() {
-                    Ok(stack) => {
-                        self.current_stack = Some(stack.clone());
-                        stack
-                    }
-                    Err(_) => {
-                        print_warning("No active stack found");
-                        return Ok(());
-                    }
-                }
-            }
-        };
+        
+        let stack = self.get_or_load_current_stack()?;
 
         println!("Stack: {} ({})", stack.name, &stack.id[..8]);
         println!("Base branch: {}", stack.base_branch);
@@ -676,9 +602,10 @@ impl StackManager {
         println!("Updated: {}", stack.updated_at.format("%Y-%m-%d %H:%M:%S UTC"));
         println!();
 
-        // Build branch hierarchy
-        let hierarchy = self.build_branch_hierarchy(stack);
-        self.print_branch_hierarchy(&hierarchy, stack, 0);
+        // Build branch hierarchy and collect MR status
+        let hierarchy = self.build_branch_hierarchy(&stack);
+        let branch_mr_status = self.collect_mr_status_info(&stack).await;
+        self.print_branch_hierarchy_with_status(&hierarchy, &stack, &branch_mr_status, 0);
 
         // Show working directory status
         let status_output = run_git_command(&["status", "--porcelain"])?;
@@ -691,23 +618,7 @@ impl StackManager {
     }
 
     pub async fn navigate_stack_interactively(&mut self) -> Result<()> {
-        use crate::utils::{NavigationAction, create_navigation_options, interactive_stack_navigation};
-        
-        // Ensure GitLab project is detected if GitLab client is available
-        if let Some(gitlab_client) = &mut self.gitlab_client {
-            if gitlab_client.get_project_details().is_none() {
-                print_info("Detecting GitLab project...");
-                match gitlab_client.detect_and_cache_project().await {
-                    Ok(project) => {
-                        print_success(&format!("Detected GitLab project: {}/{}", 
-                            project.namespace.path, project.path));
-                    }
-                    Err(_) => {
-                        print_warning("Could not auto-detect GitLab project. Some features may be limited.");
-                    }
-                }
-            }
-        }
+        use crate::utils::{NavigationAction, create_navigation_options, interactive_stack_navigation, MrStatusInfo};
         
         loop {
             // Load current stack state
@@ -731,19 +642,14 @@ impl StackManager {
             let mut branches: Vec<String> = stack.branches.keys().cloned().collect();
             branches.sort();
 
-            // Collect MR information
-            let mut branch_mrs = std::collections::HashMap::new();
-            for (branch_name, branch) in &stack.branches {
-                if let Some(mr_iid) = branch.mr_iid {
-                    branch_mrs.insert(branch_name.clone(), mr_iid);
-                }
-            }
+            // Collect MR status information (including merge status)
+            let branch_mr_status = self.collect_mr_status_info(&stack).await;
 
             // Create navigation options
             let options = create_navigation_options(
                 &branches,
                 current_git_branch.as_deref(),
-                &branch_mrs
+                &branch_mr_status
             );
 
             // Show interactive menu
@@ -776,7 +682,7 @@ impl StackManager {
                         }
                     }
                 }
-                Err(_e) => {
+                Err(e) => {
                     // User cancelled (Ctrl+C or ESC)
                     print_info("Navigation cancelled");
                     break;
@@ -872,18 +778,6 @@ impl StackManager {
         print_train_header(&format!("MR Info: !{} ({})", mr_iid, branch_name));
         
         if let Some(gitlab_client) = &self.gitlab_client {
-            // Check if we have project details
-            if gitlab_client.get_project_details().is_none() {
-                print_warning("GitLab project not detected. Please ensure:");
-                println!("  • You have a GitLab remote configured");
-                println!("  • GITLAB_TOKEN environment variable is set");
-                println!("  • GITLAB_URL is set (if not using gitlab.com)");
-                println!("  • Or set GITLAB_PROJECT_ID environment variable");
-                println!("\nPress Enter to continue...");
-                let _ = std::io::stdin().read_line(&mut String::new());
-                return;
-            }
-
             match gitlab_client.get_merge_request(mr_iid).await {
                 Ok(mr) => {
                     println!("Title: {}", mr.title);
@@ -894,8 +788,6 @@ impl StackManager {
                     println!("IID: {}", mr.iid);
                     
                     if let Some(project) = &stack.gitlab_project {
-                        println!("URL: {}/merge_requests/{}", project.web_url, mr.iid);
-                    } else if let Some(project) = gitlab_client.get_project_details() {
                         println!("URL: {}/merge_requests/{}", project.web_url, mr.iid);
                     }
                     
@@ -908,15 +800,10 @@ impl StackManager {
                 }
                 Err(e) => {
                     print_error(&format!("Failed to fetch MR info: {}", e));
-                    if e.to_string().contains("404") {
-                        print_info(&format!("MR !{} may have been deleted or moved", mr_iid));
-                    }
                 }
             }
         } else {
-            print_error("GitLab client not available. Please check your GitLab configuration:");
-            println!("  • Set GITLAB_TOKEN environment variable");
-            println!("  • Set GITLAB_URL (if not using gitlab.com)");
+            print_error("GitLab client not available");
         }
         
         println!("\nPress Enter to continue...");
@@ -942,25 +829,7 @@ impl StackManager {
         }
 
         // Create or update merge requests with intelligent target branch selection
-        if self.gitlab_client.is_some() {
-            // Ensure project is detected and cached
-            if let Some(gitlab_client) = &mut self.gitlab_client {
-                if gitlab_client.get_project_details().is_none() {
-                    let _ = gitlab_client.detect_and_cache_project().await;
-                }
-            }
-            
-            // Now use immutable reference for API calls
-            if let Some(gitlab_client) = &self.gitlab_client {
-                let branches_to_process: Vec<(String, StackBranch)> = stack.branches.clone().into_iter().collect();
-                for (branch_name, branch) in branches_to_process {
-                    match self.create_or_update_mr_with_smart_targeting_and_store(gitlab_client, &branch_name, &branch, &mut stack).await {
-                        Ok(_) => print_success(&format!("Updated merge request for {}", branch_name)),
-                        Err(e) => print_warning(&format!("Failed to update MR for {}: {}", branch_name, e)),
-                    }
-                }
-            }
-        }
+        self.process_all_branches_for_mrs(&mut stack, "Updated merge request for").await;
 
         // Save the updated stack with MR IIDs
         self.save_stack_state(&stack)?;
@@ -994,26 +863,7 @@ impl StackManager {
         // Update merge request targets if GitLab client is available
         if self.gitlab_client.is_some() {
             print_info("Updating merge request targets after sync...");
-            
-            // Ensure project is detected and cached
-            if let Some(gitlab_client) = &mut self.gitlab_client {
-                if gitlab_client.get_project_details().is_none() {
-                    let _ = gitlab_client.detect_and_cache_project().await;
-                }
-            }
-            
-            // Now use immutable reference for API calls
-            if let Some(gitlab_client) = &self.gitlab_client {
-                let branches_to_process: Vec<(String, StackBranch)> = updated_stack.branches.clone().into_iter().collect();
-                for (branch_name, branch) in branches_to_process {
-                    if branch.mr_iid.is_some() {
-                        match self.create_or_update_mr_with_smart_targeting_and_store(gitlab_client, &branch_name, &branch, &mut updated_stack).await {
-                            Ok(_) => print_success(&format!("Updated MR targets for {}", branch_name)),
-                            Err(e) => print_warning(&format!("Failed to update MR targets for {}: {}", branch_name, e)),
-                        }
-                    }
-                }
-            }
+            self.process_branches_with_mrs_for_updates(&mut updated_stack, "Updated MR targets for").await;
         }
 
         // Switch back to the original branch
@@ -1041,6 +891,8 @@ impl StackManager {
         Ok(!output.trim().is_empty())
     }
 
+
+
     fn ensure_clean_working_directory(&self) -> Result<()> {
         if self.has_uncommitted_changes()? {
             return Err(TrainError::StackError {
@@ -1048,6 +900,181 @@ impl StackManager {
             }.into());
         }
         Ok(())
+    }
+
+    /// Gets the current stack, loading it if not already cached
+    fn get_or_load_current_stack(&mut self) -> Result<Stack> {
+        match &self.current_stack {
+            Some(stack) => Ok(stack.clone()),
+            None => {
+                let stack = self.load_current_stack()?;
+                self.current_stack = Some(stack.clone());
+                Ok(stack)
+            }
+        }
+    }
+
+    /// Collects MR status information for all branches in the stack
+    async fn collect_mr_status_info(&self, stack: &Stack) -> std::collections::HashMap<String, MrStatusInfo> {
+        let mut branch_mr_status = std::collections::HashMap::new();
+        
+        if let Some(gitlab_client) = &self.gitlab_client {
+            for (branch_name, branch) in &stack.branches {
+                if let Some(mr_iid) = branch.mr_iid {
+                    // Fetch current MR status from GitLab
+                    match gitlab_client.get_merge_request(mr_iid).await {
+                        Ok(mr) => {
+                            branch_mr_status.insert(branch_name.clone(), MrStatusInfo {
+                                iid: mr_iid,
+                                state: mr.state,
+                            });
+                        }
+                        Err(_) => {
+                            // If we can't fetch MR status, show as unknown
+                            branch_mr_status.insert(branch_name.clone(), MrStatusInfo {
+                                iid: mr_iid,
+                                state: "unknown".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            // No GitLab client, just use the stored MR IIDs without status
+            for (branch_name, branch) in &stack.branches {
+                if let Some(mr_iid) = branch.mr_iid {
+                    branch_mr_status.insert(branch_name.clone(), MrStatusInfo {
+                        iid: mr_iid,
+                        state: "unknown".to_string(),
+                    });
+                }
+            }
+        }
+        
+        branch_mr_status
+    }
+
+    /// Process all branches in the stack for MR creation/updates
+    async fn process_all_branches_for_mrs(&self, stack: &mut Stack, success_message_prefix: &str) {
+        if let Some(gitlab_client) = &self.gitlab_client {
+            let branches_to_process: Vec<(String, StackBranch)> = stack.branches.clone().into_iter().collect();
+            for (branch_name, branch) in branches_to_process {
+                match self.create_or_update_mr_with_smart_targeting_and_store(gitlab_client, &branch_name, &branch, stack).await {
+                    Ok(_) => print_success(&format!("{} {}", success_message_prefix, branch_name)),
+                    Err(e) => print_warning(&format!("Failed to update MR for {}: {}", branch_name, e)),
+                }
+            }
+        }
+    }
+
+    /// Process only branches that already have MRs for updates
+    async fn process_branches_with_mrs_for_updates(&self, stack: &mut Stack, success_message_prefix: &str) {
+        if let Some(gitlab_client) = &self.gitlab_client {
+            let branches_to_process: Vec<(String, StackBranch)> = stack.branches.clone().into_iter().collect();
+            for (branch_name, branch) in branches_to_process {
+                if branch.mr_iid.is_some() {
+                    match self.create_or_update_mr_with_smart_targeting_and_store(gitlab_client, &branch_name, &branch, stack).await {
+                        Ok(_) => print_success(&format!("{} {}", success_message_prefix, branch_name)),
+                        Err(e) => print_warning(&format!("Failed to update MR for {}: {}", branch_name, e)),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Find a stack by name or ID prefix
+    fn find_stack_by_identifier(&self, stack_identifier: &str) -> Result<Stack> {
+        let stack_files = std::fs::read_dir(&self.train_dir)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                if path.extension()? == "json" && path.file_name()? != "current.json" {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for stack_file in stack_files {
+            if let Ok(stack_json) = std::fs::read_to_string(&stack_file) {
+                if let Ok(stack) = serde_json::from_str::<Stack>(&stack_json) {
+                    if stack.name == stack_identifier || stack.id.starts_with(stack_identifier) {
+                        return Ok(stack);
+                    }
+                }
+            }
+        }
+
+        Err(TrainError::StackError {
+            message: format!("Stack '{}' not found", stack_identifier),
+        }.into())
+    }
+
+    /// Format MR info for display in hierarchy
+    fn format_mr_info_for_display(&self, mr_iid: Option<u64>) -> String {
+        if let Some(iid) = mr_iid {
+            format!(" [MR !{}]", iid)
+        } else {
+            String::new()
+        }
+    }
+
+    /// Format MR info with status for enhanced display
+    fn format_mr_info_with_status(&self, branch_name: &str, branch_mr_status: &std::collections::HashMap<String, MrStatusInfo>) -> String {
+        if let Some(mr_status) = branch_mr_status.get(branch_name) {
+            let (status_icon, status_text) = match mr_status.state.as_str() {
+                "merged" => ("✅", "MERGED".to_string()),
+                "closed" => ("❌", "CLOSED".to_string()),
+                "opened" => ("🔄", "OPEN".to_string()),
+                _ => ("❓", mr_status.state.to_uppercase()),
+            };
+            format!(" [MR !{} {} {}]", mr_status.iid, status_icon, status_text)
+        } else {
+            String::new()
+        }
+    }
+
+    fn print_branch_hierarchy_with_status(&self, hierarchy: &HashMap<String, Vec<String>>, stack: &Stack, branch_mr_status: &std::collections::HashMap<String, MrStatusInfo>, indent: usize) {
+        let indent_str = "  ".repeat(indent);
+        
+        for (branch_name, branch) in &stack.branches {
+            if branch.parent.is_none() || (indent == 0 && branch.parent.as_ref() == Some(&stack.base_branch)) {
+                let status = if Some(branch_name) == stack.current_branch.as_ref() { " (current)" } else { "" };
+                let mr_info = self.format_mr_info_with_status(branch_name, branch_mr_status);
+                
+                println!("{}📋 {}{}{}", indent_str, branch_name, status, mr_info);
+                println!("{}   └─ {}", indent_str, &branch.commit_hash[..8]);
+                
+                if let Some(children) = hierarchy.get(branch_name) {
+                    for child in children {
+                        self.print_branch_details_with_status(child, stack, branch_mr_status, indent + 1);
+                        self.print_children_recursive_with_status(hierarchy, stack, branch_mr_status, child, indent + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    fn print_branch_details_with_status(&self, branch_name: &str, stack: &Stack, branch_mr_status: &std::collections::HashMap<String, MrStatusInfo>, indent: usize) {
+        let indent_str = "  ".repeat(indent);
+        
+        if let Some(branch) = stack.branches.get(branch_name) {
+            let status = if Some(branch_name) == stack.current_branch.as_deref() { " (current)" } else { "" };
+            let mr_info = self.format_mr_info_with_status(branch_name, branch_mr_status);
+            
+            println!("{}├─ {}{}{}", indent_str, branch_name, status, mr_info);
+            println!("{}│  └─ {}", indent_str, &branch.commit_hash[..8]);
+        }
+    }
+
+    fn print_children_recursive_with_status(&self, hierarchy: &HashMap<String, Vec<String>>, stack: &Stack, branch_mr_status: &std::collections::HashMap<String, MrStatusInfo>, branch_name: &str, indent: usize) {
+        if let Some(children) = hierarchy.get(branch_name) {
+            for child in children {
+                self.print_branch_details_with_status(child, stack, branch_mr_status, indent + 1);
+                self.print_children_recursive_with_status(hierarchy, stack, branch_mr_status, child, indent + 1);
+            }
+        }
     }
 
     fn determine_base_branch(&self, current_branch: &str) -> Result<String> {
@@ -1118,11 +1145,7 @@ impl StackManager {
         for (branch_name, branch) in &stack.branches {
             if branch.parent.is_none() || (indent == 0 && branch.parent.as_ref() == Some(&stack.base_branch)) {
                 let status = if Some(branch_name) == stack.current_branch.as_ref() { " (current)" } else { "" };
-                let mr_info = if let Some(iid) = branch.mr_iid { 
-                    format!(" [MR !{}]", iid) 
-                } else { 
-                    String::new() 
-                };
+                let mr_info = self.format_mr_info_for_display(branch.mr_iid);
                 
                 println!("{}📋 {}{}{}", indent_str, branch_name, status, mr_info);
                 println!("{}   └─ {}", indent_str, &branch.commit_hash[..8]);
@@ -1142,11 +1165,7 @@ impl StackManager {
         
         if let Some(branch) = stack.branches.get(branch_name) {
             let status = if Some(branch_name) == stack.current_branch.as_deref() { " (current)" } else { "" };
-            let mr_info = if let Some(iid) = branch.mr_iid { 
-                format!(" [MR !{}]", iid) 
-            } else { 
-                String::new() 
-            };
+            let mr_info = self.format_mr_info_for_display(branch.mr_iid);
             
             println!("{}├─ {}{}{}", indent_str, branch_name, status, mr_info);
             println!("{}│  └─ {}", indent_str, &branch.commit_hash[..8]);
@@ -1193,47 +1212,7 @@ impl StackManager {
         Ok(())
     }
 
-    async fn create_or_update_mr(&self, gitlab_client: &GitLabClient, branch_name: &str, branch: &StackBranch, stack: &Stack) -> Result<()> {
-        let parent_branch = branch.parent.as_deref().unwrap_or(&stack.base_branch);
-        
-        let title = format!("[Stack: {}] {}", stack.name, branch_name);
-        let description = Some(format!(
-            "Part of stack: {}\n\nBase branch: {}\nParent branch: {}\n\nStack ID: {}",
-            stack.name, stack.base_branch, parent_branch, stack.id
-        ));
 
-        if branch.mr_iid.is_none() {
-            // Create new MR
-            let request = CreateMergeRequestRequest {
-                source_branch: branch_name.to_string(),
-                target_branch: parent_branch.to_string(),
-                title,
-                description,
-            };
-
-            match gitlab_client.create_merge_request(request).await {
-                Ok(mr) => {
-                    print_success(&format!("Created MR !{} for branch {}", mr.iid, branch_name));
-                }
-                Err(e) => {
-                    print_warning(&format!("Failed to create MR for {}: {}", branch_name, e));
-                }
-            }
-        } else {
-            // Update existing MR
-            let iid = branch.mr_iid.unwrap();
-            match gitlab_client.update_merge_request(iid, Some(title), description).await {
-                Ok(_) => {
-                    print_success(&format!("Updated MR !{} for branch {}", iid, branch_name));
-                }
-                Err(e) => {
-                    print_warning(&format!("Failed to update MR !{} for {}: {}", iid, branch_name, e));
-                }
-            }
-        }
-
-        Ok(())
-    }
 
     /// Intelligently determine the optimal target branch for a given branch in the stack
     async fn determine_optimal_target_branch(&self, branch_name: &str, stack: &Stack, gitlab_client: &GitLabClient) -> Result<String> {
