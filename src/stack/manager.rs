@@ -1078,6 +1078,10 @@ impl StackManager {
 
         match git_state {
             GitState::Clean => Ok(()),
+            GitState::StaleRebase | GitState::StaleMerge | GitState::StaleCherryPick => {
+                self.conflict_resolver.cleanup_stale_state(git_state.clone())?;
+                Ok(())
+            }
             GitState::Rebasing | GitState::Merging | GitState::CherryPicking => {
                 print_warning(&format!(
                     "Git is in state {:?}. Recovery options:",

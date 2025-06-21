@@ -12,6 +12,56 @@ pub struct ConflictInfo {
     pub files: Vec<ConflictFile>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use std::fs;
+    use std::path::Path;
+
+    fn init_repo(dir: &Path) {
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir)
+            .output()
+            .expect("git init");
+        fs::write(dir.join("file.txt"), "hello").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_git_state_clean() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let repo = GitRepository::new(tmp.path()).unwrap();
+        let resolver = ConflictResolver::new(TrainConfig::default(), tmp.path().join(".git"), repo);
+        let state = resolver.get_git_state().unwrap();
+        assert!(matches!(state, GitState::Clean));
+    }
+
+    #[test]
+    fn test_git_state_stale_rebase_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        fs::write(tmp.path().join(".git/REBASE_HEAD"), "dummy").unwrap();
+        let repo = GitRepository::new(tmp.path()).unwrap();
+        let resolver = ConflictResolver::new(TrainConfig::default(), tmp.path().join(".git"), repo);
+        let state = resolver.get_git_state().unwrap();
+        assert!(matches!(state, GitState::StaleRebase));
+        resolver.cleanup_stale_state(state).unwrap();
+        assert!(!tmp.path().join(".git/REBASE_HEAD").exists());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ConflictFile {
     pub path: String,
@@ -34,6 +84,9 @@ pub enum GitState {
     Merging,
     CherryPicking,
     Conflicted,
+    StaleRebase,
+    StaleMerge,
+    StaleCherryPick,
 }
 
 pub struct ConflictResolver {
@@ -75,33 +128,26 @@ impl ConflictResolver {
 
         // Now check for ongoing operations, but verify they're actually active
         if git_dir.join("REBASE_HEAD").exists() {
-            // Double-check if rebase is actually in progress
             if self.is_rebase_actually_active()? {
                 return Ok(GitState::Rebasing);
             } else {
-                // Clean up stale rebase files
-                ui::print_info("Detected stale rebase state files, cleaning up...");
-                self.cleanup_stale_rebase_files()?;
+                return Ok(GitState::StaleRebase);
             }
         }
 
         if git_dir.join("MERGE_HEAD").exists() {
-            // Double-check if merge is actually in progress
             if self.is_merge_actually_active()? {
                 return Ok(GitState::Merging);
             } else {
-                ui::print_info("Detected stale merge state files, cleaning up...");
-                self.cleanup_stale_merge_files()?;
+                return Ok(GitState::StaleMerge);
             }
         }
 
         if git_dir.join("CHERRY_PICK_HEAD").exists() {
-            // Double-check if cherry-pick is actually in progress
             if self.is_cherry_pick_actually_active()? {
                 return Ok(GitState::CherryPicking);
             } else {
-                ui::print_info("Detected stale cherry-pick state files, cleaning up...");
-                self.cleanup_stale_cherry_pick_files()?;
+                return Ok(GitState::StaleCherryPick);
             }
         }
 
@@ -110,34 +156,26 @@ impl ConflictResolver {
 
     /// Check if a rebase is actually in progress (not just stale files)
     fn is_rebase_actually_active(&self) -> Result<bool> {
-        // Try to get rebase info - this will fail if no rebase is actually in progress
-        match self.git_repo.run(&["rebase", "--show-current-patch"]) {
-            Ok(_) => Ok(true),
-            Err(_) => {
-                // Also check for rebase directories that would exist during an active rebase
-                let git_dir = &self.git_dir;
-                Ok(git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists())
-            }
-        }
+        let git_dir = &self.git_dir;
+        Ok(git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists())
     }
 
     /// Check if a merge is actually in progress
     fn is_merge_actually_active(&self) -> Result<bool> {
-        // Check if MERGE_MSG exists and is recent, and if there are actual merge conflicts
-        let git_dir = &self.git_dir;
-        Ok(git_dir.join("MERGE_MSG").exists() && git_dir.join("MERGE_HEAD").exists())
+        if !self.git_dir.join("MERGE_HEAD").exists() {
+            return Ok(false);
+        }
+        let output = self.git_repo.run(&["ls-files", "-u"])?;
+        Ok(!output.trim().is_empty())
     }
 
     /// Check if a cherry-pick is actually in progress
     fn is_cherry_pick_actually_active(&self) -> Result<bool> {
-        // Try to continue cherry-pick to see if it's actually in progress
-        match self
-            .git_repo
-            .run(&["cherry-pick", "--continue", "--dry-run"])
-        {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
+        if !self.git_dir.join("CHERRY_PICK_HEAD").exists() {
+            return Ok(false);
         }
+        let output = self.git_repo.run(&["ls-files", "-u"])?;
+        Ok(!output.trim().is_empty())
     }
 
     /// Clean up stale rebase files
@@ -213,6 +251,16 @@ impl ConflictResolver {
         Ok(())
     }
 
+    /// Cleanup stale state files based on detected git state
+    pub fn cleanup_stale_state(&self, state: GitState) -> Result<()> {
+        match state {
+            GitState::StaleRebase => self.cleanup_stale_rebase_files(),
+            GitState::StaleMerge => self.cleanup_stale_merge_files(),
+            GitState::StaleCherryPick => self.cleanup_stale_cherry_pick_files(),
+            _ => Ok(()),
+        }
+    }
+
     /// Detect and analyze conflicts in the repository
     pub fn detect_conflicts(&self) -> Result<Option<ConflictInfo>> {
         let git_state = self.get_git_state()?;
@@ -223,6 +271,11 @@ impl ConflictResolver {
             | GitState::Merging
             | GitState::CherryPicking
             | GitState::Conflicted => self.analyze_conflicts(),
+            stale_state => {
+                // If state files are stale, clean them up and report no conflicts
+                self.cleanup_stale_state(stale_state)?;
+                Ok(None)
+            }
         }
     }
 
@@ -366,7 +419,8 @@ impl ConflictResolver {
         // Add resolved files and continue
         self.git_repo.run(&["add", "."])?;
 
-        match self.get_git_state()? {
+        let state = self.get_git_state()?;
+        match state {
             GitState::Rebasing => {
                 self.git_repo.run(&["rebase", "--continue"])?;
                 ui::print_success("Rebase continued successfully");
@@ -378,6 +432,10 @@ impl ConflictResolver {
             GitState::CherryPicking => {
                 self.git_repo.run(&["cherry-pick", "--continue"])?;
                 ui::print_success("Cherry-pick continued successfully");
+            }
+            GitState::StaleRebase | GitState::StaleMerge | GitState::StaleCherryPick => {
+                self.cleanup_stale_state(state)?;
+                ui::print_success("Cleaned up stale state");
             }
             _ => {
                 ui::print_success("Conflicts resolved");
@@ -446,7 +504,8 @@ impl ConflictResolver {
     }
 
     pub fn abort_current_operation(&self) -> Result<()> {
-        match self.get_git_state()? {
+        let state = self.get_git_state()?;
+        match state {
             GitState::Rebasing => {
                 self.git_repo.run(&["rebase", "--abort"])?;
                 ui::print_info("Rebase aborted");
@@ -458,6 +517,10 @@ impl ConflictResolver {
             GitState::CherryPicking => {
                 self.git_repo.run(&["cherry-pick", "--abort"])?;
                 ui::print_info("Cherry-pick aborted");
+            }
+            GitState::StaleRebase | GitState::StaleMerge | GitState::StaleCherryPick => {
+                self.cleanup_stale_state(state)?;
+                ui::print_info("Stale state cleaned up");
             }
             _ => {
                 ui::print_warning("No operation to abort");
