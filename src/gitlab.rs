@@ -326,4 +326,60 @@ impl GitLabClient {
             }.into())
         }
     }
+
+    /// Update merge request with optional target branch change
+    pub async fn update_merge_request_with_target(&self, iid: u64, title: Option<String>, description: Option<String>, target_branch: Option<String>) -> Result<MergeRequest> {
+        let project_id = self.get_project_id_for_api()?;
+        let url = format!("{}/api/v4/projects/{}/merge_requests/{}", self.base_url, project_id, iid);
+        
+        let mut params = serde_json::Map::new();
+        if let Some(title) = title {
+            params.insert("title".to_string(), serde_json::Value::String(title));
+        }
+        if let Some(description) = description {
+            params.insert("description".to_string(), serde_json::Value::String(description));
+        }
+        if let Some(target_branch) = target_branch {
+            params.insert("target_branch".to_string(), serde_json::Value::String(target_branch));
+        }
+
+        let response = self.client
+            .put(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .json(&params)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let mr: MergeRequest = response.json().await?;
+            Ok(mr)
+        } else {
+            let error_text = response.text().await?;
+            Err(TrainError::GitLabError {
+                message: format!("Failed to update MR with target: {}", error_text),
+            }.into())
+        }
+    }
+
+    /// Get the current state of a merge request
+    pub async fn get_merge_request(&self, iid: u64) -> Result<MergeRequest> {
+        let project_id = self.get_project_id_for_api()?;
+        let url = format!("{}/api/v4/projects/{}/merge_requests/{}", self.base_url, project_id, iid);
+        
+        let response = self.client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let mr: MergeRequest = response.json().await?;
+            Ok(mr)
+        } else {
+            let error_text = response.text().await?;
+            Err(TrainError::GitLabError {
+                message: format!("Failed to get MR: {}", error_text),
+            }.into())
+        }
+    }
 } 
