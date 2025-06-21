@@ -1,9 +1,8 @@
 use anyhow::Result;
-use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::config::{AutoResolveStrategy, TrainConfig};
+use crate::config::TrainConfig;
 use crate::errors::TrainError;
 use crate::utils::{
     confirm_action, print_error, print_info, print_success, print_warning, run_git_command,
@@ -12,22 +11,12 @@ use crate::utils::{
 #[derive(Debug, Clone)]
 pub struct ConflictInfo {
     pub files: Vec<ConflictFile>,
-    pub conflict_type: ConflictType,
-    pub can_auto_resolve: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ConflictFile {
     pub path: String,
     pub status: ConflictStatus,
-    pub conflict_markers: Vec<ConflictMarker>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ConflictMarker {
-    pub line_number: usize,
-    pub marker_type: ConflictMarkerType,
-    pub content: String,
 }
 
 #[derive(Debug, Clone)]
@@ -37,21 +26,6 @@ pub enum ConflictStatus {
     AddedByThem,
     DeletedByUs,
     DeletedByThem,
-}
-
-#[derive(Debug, Clone)]
-pub enum ConflictMarkerType {
-    Ours,      // <<<<<<< HEAD
-    Theirs,    // >>>>>>> commit
-    Separator, // =======
-}
-
-#[derive(Debug, Clone)]
-pub enum ConflictType {
-    Rebase,
-    Merge,
-    CherryPick,
-    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -238,23 +212,17 @@ impl ConflictResolver {
 
         match git_state {
             GitState::Clean => Ok(None),
-            GitState::Rebasing => self.analyze_rebase_conflicts(),
-            GitState::Merging => self.analyze_merge_conflicts(),
-            GitState::CherryPicking => self.analyze_cherry_pick_conflicts(),
-            GitState::Conflicted => self.analyze_working_directory_conflicts(),
+            GitState::Rebasing
+            | GitState::Merging
+            | GitState::CherryPicking
+            | GitState::Conflicted => self.analyze_conflicts(),
         }
     }
 
     /// Attempt to resolve conflicts automatically based on configuration
-    pub async fn auto_resolve_conflicts(&self, conflict_info: &ConflictInfo) -> Result<bool> {
-        match self.config.conflict_resolution.auto_resolve_strategy {
-            AutoResolveStrategy::Never => {
-                print_info("Auto-resolution disabled, will prompt for manual resolution");
-                Ok(false)
-            }
-            AutoResolveStrategy::Simple => self.attempt_simple_resolution(conflict_info).await,
-            AutoResolveStrategy::Smart => self.attempt_smart_resolution(conflict_info).await,
-        }
+    pub async fn auto_resolve_conflicts(&self, _conflict_info: &ConflictInfo) -> Result<bool> {
+        print_info("Automatic conflict resolution is disabled");
+        Ok(false)
     }
 
     /// Handle conflicts with user intervention
@@ -262,14 +230,13 @@ impl ConflictResolver {
         &self,
         conflict_info: &ConflictInfo,
     ) -> Result<()> {
-        print_info("Conflicts detected. Opening editor for manual resolution...");
+        print_info("Conflicts detected. Manual resolution required.");
 
         // Show conflict summary
         self.print_conflict_summary(conflict_info);
 
         // Ask user how they want to proceed
         let options = vec![
-            "Try automatic resolution",
             "Open editor to resolve conflicts manually",
             "Abort current operation",
         ];
@@ -294,17 +261,8 @@ impl ConflictResolver {
         };
 
         match choice {
-            0 => {
-                if self.auto_resolve_conflicts(conflict_info).await? {
-                    print_success("Conflicts resolved automatically");
-                    self.verify_conflicts_resolved().await
-                } else {
-                    print_warning("Automatic resolution failed, falling back to manual resolution");
-                    self.open_editor_for_conflicts(conflict_info).await
-                }
-            }
-            1 => self.open_editor_for_conflicts(conflict_info).await,
-            2 => {
+            0 => self.open_editor_for_conflicts(conflict_info).await,
+            1 => {
                 self.abort_current_operation()?;
                 print_success("Current operation aborted. Repository is now clean.");
                 Ok(())
@@ -420,120 +378,7 @@ impl ConflictResolver {
         Ok(())
     }
 
-    /// Attempt simple automatic conflict resolution
-    async fn attempt_simple_resolution(&self, conflict_info: &ConflictInfo) -> Result<bool> {
-        let mut resolved_count = 0;
-
-        for conflict_file in &conflict_info.files {
-            if self.can_resolve_simple(conflict_file)?
-                && self.resolve_simple_conflict(conflict_file)?
-            {
-                resolved_count += 1;
-                print_success(&format!(
-                    "Auto-resolved simple conflict in {}",
-                    conflict_file.path
-                ));
-            }
-        }
-
-        if resolved_count == conflict_info.files.len() {
-            run_git_command(&["add", "."])?;
-            Ok(true)
-        } else {
-            print_warning(&format!(
-                "Only resolved {} of {} conflicts",
-                resolved_count,
-                conflict_info.files.len()
-            ));
-            Ok(false)
-        }
-    }
-
-    /// Attempt smart automatic conflict resolution
-    async fn attempt_smart_resolution(&self, conflict_info: &ConflictInfo) -> Result<bool> {
-        // First try simple resolution
-        if self.attempt_simple_resolution(conflict_info).await? {
-            return Ok(true);
-        }
-
-        // Try more sophisticated resolution strategies
-        let mut resolved_count = 0;
-
-        for conflict_file in &conflict_info.files {
-            if self.can_resolve_smart(conflict_file)?
-                && self.resolve_smart_conflict(conflict_file)?
-            {
-                resolved_count += 1;
-                print_success(&format!("Auto-resolved conflict in {}", conflict_file.path));
-            }
-        }
-
-        if resolved_count == conflict_info.files.len() {
-            run_git_command(&["add", "."])?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    /// Check if a conflict can be resolved with simple strategies
-    fn can_resolve_simple(&self, conflict_file: &ConflictFile) -> Result<bool> {
-        let content = fs::read_to_string(&conflict_file.path)?;
-
-        // Simple cases we can auto-resolve:
-        // 1. Whitespace-only conflicts
-        // 2. Line ending conflicts
-        // 3. Import/include order conflicts
-
-        for marker in &conflict_file.conflict_markers {
-            if !self.is_whitespace_conflict(&content, marker)?
-                && !self.is_line_ending_conflict(&content, marker)?
-                && !self.is_import_order_conflict(&content, marker)?
-            {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    }
-
-    /// Check if a conflict can be resolved with smart strategies
-    fn can_resolve_smart(&self, conflict_file: &ConflictFile) -> Result<bool> {
-        let content = fs::read_to_string(&conflict_file.path)?;
-
-        // Smart resolution strategies:
-        // 1. All simple cases
-        // 2. Non-overlapping changes
-        // 3. Clear preference patterns (e.g., always take newer version)
-
-        if self.can_resolve_simple(conflict_file)? {
-            return Ok(true);
-        }
-
-        // Check for non-overlapping changes
-        self.has_non_overlapping_changes(&content, conflict_file)
-    }
-
-    fn analyze_rebase_conflicts(&self) -> Result<Option<ConflictInfo>> {
-        self.analyze_conflicts_by_type(ConflictType::Rebase)
-    }
-
-    fn analyze_merge_conflicts(&self) -> Result<Option<ConflictInfo>> {
-        self.analyze_conflicts_by_type(ConflictType::Merge)
-    }
-
-    fn analyze_cherry_pick_conflicts(&self) -> Result<Option<ConflictInfo>> {
-        self.analyze_conflicts_by_type(ConflictType::CherryPick)
-    }
-
-    fn analyze_working_directory_conflicts(&self) -> Result<Option<ConflictInfo>> {
-        self.analyze_conflicts_by_type(ConflictType::Unknown)
-    }
-
-    fn analyze_conflicts_by_type(
-        &self,
-        conflict_type: ConflictType,
-    ) -> Result<Option<ConflictInfo>> {
+    fn analyze_conflicts(&self) -> Result<Option<ConflictInfo>> {
         let status_output = run_git_command(&["status", "--porcelain"])?;
         let mut conflict_files = Vec::new();
 
@@ -547,14 +392,8 @@ impl ConflictResolver {
             return Ok(None);
         }
 
-        let can_auto_resolve = conflict_files
-            .iter()
-            .all(|f| self.can_resolve_simple(f).unwrap_or(false));
-
         Ok(Some(ConflictInfo {
             files: conflict_files,
-            conflict_type,
-            can_auto_resolve,
         }))
     }
 
@@ -575,47 +414,10 @@ impl ConflictResolver {
             _ => return Ok(None),
         };
 
-        let conflict_markers = self.find_conflict_markers(&file_path)?;
-
         Ok(Some(ConflictFile {
             path: file_path,
             status,
-            conflict_markers,
         }))
-    }
-
-    fn find_conflict_markers(&self, file_path: &str) -> Result<Vec<ConflictMarker>> {
-        let content = match fs::read_to_string(file_path) {
-            Ok(content) => content,
-            Err(_) => return Ok(Vec::new()), // File might be deleted
-        };
-
-        let mut markers = Vec::new();
-        let lines: Vec<&str> = content.lines().collect();
-
-        for (line_num, line) in lines.iter().enumerate() {
-            if line.starts_with("<<<<<<<") {
-                markers.push(ConflictMarker {
-                    line_number: line_num + 1,
-                    marker_type: ConflictMarkerType::Ours,
-                    content: line.to_string(),
-                });
-            } else if line.starts_with("=======") {
-                markers.push(ConflictMarker {
-                    line_number: line_num + 1,
-                    marker_type: ConflictMarkerType::Separator,
-                    content: line.to_string(),
-                });
-            } else if line.starts_with(">>>>>>>") {
-                markers.push(ConflictMarker {
-                    line_number: line_num + 1,
-                    marker_type: ConflictMarkerType::Theirs,
-                    content: line.to_string(),
-                });
-            }
-        }
-
-        Ok(markers)
     }
 
     pub fn print_conflict_summary(&self, conflict_info: &ConflictInfo) {
@@ -626,19 +428,9 @@ impl ConflictResolver {
 
         for conflict_file in &conflict_info.files {
             println!("  📄 {} ({:?})", conflict_file.path, conflict_file.status);
-            if !conflict_file.conflict_markers.is_empty() {
-                println!(
-                    "     {} conflict markers found",
-                    conflict_file.conflict_markers.len()
-                );
-            }
         }
 
-        if conflict_info.can_auto_resolve {
-            print_info("These conflicts may be automatically resolvable");
-        } else {
-            print_warning("Manual resolution may be required");
-        }
+        print_warning("Manual resolution required");
     }
 
     pub fn abort_current_operation(&self) -> Result<()> {
@@ -674,270 +466,5 @@ impl ConflictResolver {
 
         print_success("Cleaned up all stale git state files");
         Ok(())
-    }
-
-    // Implement actual conflict resolution strategies
-    fn resolve_simple_conflict(&self, conflict_file: &ConflictFile) -> Result<bool> {
-        let content = fs::read_to_string(&conflict_file.path)?;
-        let mut modified = false;
-        let mut new_content = content.clone();
-
-        // Try to resolve each conflict marker
-        for marker in &conflict_file.conflict_markers {
-            if self.is_whitespace_conflict(&content, marker)? {
-                new_content = self.resolve_whitespace_conflict(&new_content, marker)?;
-                modified = true;
-            } else if self.is_line_ending_conflict(&content, marker)? {
-                new_content = self.resolve_line_ending_conflict(&new_content, marker)?;
-                modified = true;
-            } else if self.is_import_order_conflict(&content, marker)? {
-                new_content = self.resolve_import_order_conflict(&new_content, marker)?;
-                modified = true;
-            }
-        }
-
-        if modified {
-            fs::write(&conflict_file.path, new_content)?;
-            print_success(&format!(
-                "Auto-resolved simple conflicts in {}",
-                conflict_file.path
-            ));
-        }
-
-        Ok(modified)
-    }
-
-    fn resolve_smart_conflict(&self, conflict_file: &ConflictFile) -> Result<bool> {
-        let content = fs::read_to_string(&conflict_file.path)?;
-
-        // First try simple resolution
-        if self.resolve_simple_conflict(conflict_file)? {
-            return Ok(true);
-        }
-
-        // Try non-overlapping changes resolution
-        if self.has_non_overlapping_changes(&content, conflict_file)? {
-            return self.resolve_non_overlapping_conflict(conflict_file);
-        }
-
-        Ok(false)
-    }
-
-    fn is_whitespace_conflict(&self, content: &str, marker: &ConflictMarker) -> Result<bool> {
-        let lines: Vec<&str> = content.lines().collect();
-
-        // Find the conflict block
-        let start_line = marker.line_number.saturating_sub(1);
-        let mut ours_lines = Vec::new();
-        let mut theirs_lines = Vec::new();
-        let mut in_ours = false;
-        let mut in_theirs = false;
-
-        for (i, line) in lines.iter().enumerate() {
-            if i >= start_line {
-                if line.starts_with("<<<<<<<") {
-                    in_ours = true;
-                    continue;
-                } else if line.starts_with("=======") {
-                    in_ours = false;
-                    in_theirs = true;
-                    continue;
-                } else if line.starts_with(">>>>>>>") {
-                    break;
-                }
-
-                if in_ours {
-                    ours_lines.push(*line);
-                } else if in_theirs {
-                    theirs_lines.push(*line);
-                }
-            }
-        }
-
-        // Check if the only differences are whitespace
-        if ours_lines.len() == theirs_lines.len() {
-            for (our_line, their_line) in ours_lines.iter().zip(theirs_lines.iter()) {
-                if our_line.trim() != their_line.trim() {
-                    return Ok(false);
-                }
-            }
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-
-    fn is_line_ending_conflict(&self, content: &str, _marker: &ConflictMarker) -> Result<bool> {
-        // Simple heuristic: if the file contains mixed line endings, it might be a line ending conflict
-        let has_crlf = content.contains("\r\n");
-        let has_lf = content.contains('\n') && !content.contains("\r\n");
-
-        Ok(has_crlf && has_lf)
-    }
-
-    fn is_import_order_conflict(&self, content: &str, marker: &ConflictMarker) -> Result<bool> {
-        let lines: Vec<&str> = content.lines().collect();
-        let start_line = marker.line_number.saturating_sub(1);
-
-        // Check if conflict is in import/include section
-        for (i, line) in lines.iter().enumerate() {
-            if i >= start_line && i < start_line + 10 {
-                // Look in the vicinity
-                let trimmed = line.trim();
-                if trimmed.starts_with("import ")
-                    || trimmed.starts_with("from ")
-                    || trimmed.starts_with("#include")
-                    || trimmed.starts_with("use ")
-                {
-                    return Ok(true);
-                }
-            }
-        }
-
-        Ok(false)
-    }
-
-    fn has_non_overlapping_changes(
-        &self,
-        content: &str,
-        conflict_file: &ConflictFile,
-    ) -> Result<bool> {
-        // Simplified check: if there are multiple conflict blocks that don't seem to interact
-        Ok(conflict_file.conflict_markers.len() == 3) // Standard conflict has exactly 3 markers
-    }
-
-    fn resolve_whitespace_conflict(
-        &self,
-        content: &str,
-        marker: &ConflictMarker,
-    ) -> Result<String> {
-        let lines: Vec<&str> = content.lines().collect();
-        let mut result_lines = Vec::new();
-        let start_line = marker.line_number.saturating_sub(1);
-        let mut i = 0;
-
-        while i < lines.len() {
-            if i == start_line && lines[i].starts_with("<<<<<<<") {
-                // Found conflict start, collect 'ours' lines (normalized)
-                i += 1; // Skip conflict marker
-                let mut resolved_lines = Vec::new();
-
-                while i < lines.len() && !lines[i].starts_with("=======") {
-                    resolved_lines.push(lines[i].trim_end().to_string()); // Normalize whitespace
-                    i += 1;
-                }
-
-                // Skip separator and 'theirs' lines
-                i += 1; // Skip =======
-                while i < lines.len() && !lines[i].starts_with(">>>>>>>") {
-                    i += 1;
-                }
-                i += 1; // Skip >>>>>>>
-
-                // Add resolved lines
-                result_lines.extend(resolved_lines);
-            } else {
-                result_lines.push(lines[i].to_string());
-                i += 1;
-            }
-        }
-
-        Ok(result_lines.join("\n"))
-    }
-
-    fn resolve_line_ending_conflict(
-        &self,
-        content: &str,
-        _marker: &ConflictMarker,
-    ) -> Result<String> {
-        // Normalize to Unix line endings
-        Ok(content.replace("\r\n", "\n"))
-    }
-
-    fn resolve_import_order_conflict(
-        &self,
-        content: &str,
-        marker: &ConflictMarker,
-    ) -> Result<String> {
-        let lines: Vec<&str> = content.lines().collect();
-        let mut result_lines = Vec::new();
-        let start_line = marker.line_number.saturating_sub(1);
-        let mut i = 0;
-
-        while i < lines.len() {
-            if i == start_line && lines[i].starts_with("<<<<<<<") {
-                // Collect all import lines from both sides and sort them
-                let mut import_lines = std::collections::HashSet::new();
-                i += 1; // Skip conflict marker
-
-                // Collect 'ours' imports
-                while i < lines.len() && !lines[i].starts_with("=======") {
-                    let line = lines[i].trim();
-                    if !line.is_empty() {
-                        import_lines.insert(line.to_string());
-                    }
-                    i += 1;
-                }
-
-                i += 1; // Skip =======
-
-                // Collect 'theirs' imports
-                while i < lines.len() && !lines[i].starts_with(">>>>>>>") {
-                    let line = lines[i].trim();
-                    if !line.is_empty() {
-                        import_lines.insert(line.to_string());
-                    }
-                    i += 1;
-                }
-
-                i += 1; // Skip >>>>>>>
-
-                // Sort and add import lines
-                let mut sorted_imports: Vec<String> = import_lines.into_iter().collect();
-                sorted_imports.sort();
-                result_lines.extend(sorted_imports);
-            } else {
-                result_lines.push(lines[i].to_string());
-                i += 1;
-            }
-        }
-
-        Ok(result_lines.join("\n"))
-    }
-
-    fn resolve_non_overlapping_conflict(&self, conflict_file: &ConflictFile) -> Result<bool> {
-        let content = fs::read_to_string(&conflict_file.path)?;
-        let lines: Vec<&str> = content.lines().collect();
-        let mut result_lines = Vec::new();
-        let mut i = 0;
-
-        while i < lines.len() {
-            if lines[i].starts_with("<<<<<<<") {
-                // Take both 'ours' and 'theirs' sections
-                i += 1; // Skip conflict marker
-
-                // Add 'ours' lines
-                while i < lines.len() && !lines[i].starts_with("=======") {
-                    result_lines.push(lines[i].to_string());
-                    i += 1;
-                }
-
-                i += 1; // Skip =======
-
-                // Add 'theirs' lines
-                while i < lines.len() && !lines[i].starts_with(">>>>>>>") {
-                    result_lines.push(lines[i].to_string());
-                    i += 1;
-                }
-
-                i += 1; // Skip >>>>>>>
-            } else {
-                result_lines.push(lines[i].to_string());
-                i += 1;
-            }
-        }
-
-        fs::write(&conflict_file.path, result_lines.join("\n"))?;
-        Ok(true)
     }
 }
