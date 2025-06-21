@@ -559,7 +559,7 @@ impl StackManager {
                         String::new()
                     };
 
-                    println!("📋 {} ({}){}", stack.name, &stack.id[..8], is_current);
+                    println!("▶ {} ({}){}", stack.name, &stack.id[..8], is_current);
                     println!(
                         "   └─ Base: {} | Branches: {} | Updated: {}{}",
                         stack.base_branch,
@@ -1012,7 +1012,7 @@ impl StackManager {
         if !push_failures.is_empty() {
             print_warning(&format!("Failed to push {} branches:", push_failures.len()));
             for (branch, error) in &push_failures {
-                println!("  ❌ {}: {}", branch, error);
+                println!("  ✘ {}: {}", branch, error);
             }
             print_info("You can:");
             print_info("• Run 'git-train sync' to ensure branches are up to date");
@@ -1566,7 +1566,7 @@ impl StackManager {
                 };
                 let mr_info = format_mr_info_with_status(branch_name, branch_mr_status);
 
-                println!("{}📋 {}{}{}", indent_str, branch_name, status, mr_info);
+                println!("{}▶ {}{}{}", indent_str, branch_name, status, mr_info);
                 println!("{}   └─ {}", indent_str, &branch.commit_hash[..8]);
 
                 if let Some(children) = hierarchy.get(branch_name) {
@@ -2031,10 +2031,10 @@ fn format_mr_info_with_status(
 ) -> String {
     if let Some(mr_status) = branch_mr_status.get(branch_name) {
         let (status_icon, status_text) = match mr_status.state.as_str() {
-            "merged" => ("✅", "MERGED".to_string()),
-            "closed" => ("❌", "CLOSED".to_string()),
-            "opened" => ("🔄", "OPEN".to_string()),
-            _ => ("❓", mr_status.state.to_uppercase()),
+            "merged" => ("✔", "MERGED".to_string()),
+            "closed" => ("✘", "CLOSED".to_string()),
+            "opened" => ("●", "OPEN".to_string()),
+            _ => ("?", mr_status.state.to_uppercase()),
         };
         format!(" [MR !{} {} {}]", mr_status.iid, status_icon, status_text)
     } else {

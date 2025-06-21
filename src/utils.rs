@@ -74,62 +74,135 @@ pub fn create_navigation_options(
 ) -> Vec<NavigationOption> {
     let mut options = Vec::new();
 
+    // Add section separator
+    options.push(NavigationOption {
+        display: style("── BRANCHES ────────────────────────────────").dim().to_string(),
+        action: NavigationAction::RefreshStatus, // Dummy action
+    });
+
     // Add branch navigation options
     for branch in branches {
         let is_current = current_branch.is_some_and(|current| current == branch);
         let mr_info = if let Some(mr_status) = branch_mr_status.get(branch) {
-            let (status_icon, status_text, priority_indicator) = match mr_status.state.as_str() {
-                "merged" => ("✅", "MERGED".to_string(), " 🎉"),
-                "closed" => ("❌", "CLOSED".to_string(), ""),
-                "opened" => ("🔄", "OPEN".to_string(), " 🚀"),
-                _ => ("❓", mr_status.state.to_uppercase(), ""),
+            let (status_symbol, status_text) = match mr_status.state.as_str() {
+                "merged" => ("✔", "MERGED"),
+                "closed" => ("✘", "CLOSED"),
+                "opened" => ("●", "OPEN"),
+                _ => ("?", mr_status.state.as_str()),
             };
-            format!(
-                " [MR !{} {} {}{}]",
-                mr_status.iid, status_icon, status_text, priority_indicator
-            )
+            format!(" [MR !{} {} {}]", mr_status.iid, status_symbol, status_text)
         } else {
             String::new()
         };
 
-        let display = if is_current {
-            format!("🔸 {} (current){}", branch, mr_info)
+        let styled_symbol = if is_current {
+            style("▶").bold().cyan()
         } else {
-            format!("📋 {}{}", branch, mr_info)
+            style("│")
         };
 
+        let display = format!(
+            "{} {} {}{}",
+            styled_symbol,
+            style(branch).bold(),
+            if is_current { style(" (current)").dim() } else { style("") },
+            style(&mr_info).dim()
+        );
+
         options.push(NavigationOption {
-            display: display.clone(),
+            display,
             action: NavigationAction::SwitchToBranch(branch.clone()),
         });
+    }
 
-        // Add additional actions for each branch
+    // Add section separator for actions
+    options.push(NavigationOption {
+        display: style("── ACTIONS ─────────────────────────────────").dim().to_string(),
+        action: NavigationAction::RefreshStatus, // Dummy action
+    });
+
+    // Add branch-specific actions grouped by current branch
+    if let Some(current) = current_branch {
+        if branches.contains(&current.to_string()) {
+            // Show info action for current branch
+            options.push(NavigationOption {
+                display: format!("  {} Show info for {}", 
+                    style("ℹ").blue(),
+                    style(current).bold()
+                ),
+                action: NavigationAction::ShowBranchInfo(current.to_string()),
+            });
+
+            // MR action for current branch
+            if let Some(mr_status) = branch_mr_status.get(current) {
+                options.push(NavigationOption {
+                    display: format!("  {} View MR !{} for {}", 
+                        style("→").green(),
+                        mr_status.iid,
+                        style(current).bold()
+                    ),
+                    action: NavigationAction::ViewMR(current.to_string(), mr_status.iid),
+                });
+            } else {
+                options.push(NavigationOption {
+                    display: format!("  {} Create MR for {}", 
+                        style("+").green(),
+                        style(current).bold()
+                    ),
+                    action: NavigationAction::CreateMR(current.to_string()),
+                });
+            }
+        }
+    }
+
+    // Add other branch actions in a submenu style
+    for branch in branches {
+        if Some(branch.as_str()) == current_branch {
+            continue; // Skip current branch as we already handled it above
+        }
+
         options.push(NavigationOption {
-            display: format!("  ℹ️  Show info for {}", branch),
+            display: format!("  {} Show info for {}", 
+                style("ℹ").blue().dim(),
+                style(branch).dim()
+            ),
             action: NavigationAction::ShowBranchInfo(branch.clone()),
         });
 
         if let Some(mr_status) = branch_mr_status.get(branch) {
             options.push(NavigationOption {
-                display: format!("  🔗 View MR !{} for {}", mr_status.iid, branch),
+                display: format!("  {} View MR !{} for {}", 
+                    style("→").green().dim(),
+                    mr_status.iid,
+                    style(branch).dim()
+                ),
                 action: NavigationAction::ViewMR(branch.clone(), mr_status.iid),
             });
         } else {
             options.push(NavigationOption {
-                display: format!("  ➕ Create MR for {}", branch),
+                display: format!("  {} Create MR for {}", 
+                    style("+").green().dim(),
+                    style(branch).dim()
+                ),
                 action: NavigationAction::CreateMR(branch.clone()),
             });
         }
     }
 
+    // Add final section separator
+    options.push(NavigationOption {
+        display: style("── UTILITIES ───────────────────────────────").dim().to_string(),
+        action: NavigationAction::RefreshStatus, // Dummy action
+    });
+
     // Add utility options
     options.push(NavigationOption {
-        display: "🔄 Refresh status".to_string(),
+        display: format!("  {} Refresh status", style("↻").cyan()),
         action: NavigationAction::RefreshStatus,
     });
 
     options.push(NavigationOption {
-        display: "❌ Exit navigation".to_string(),
+        display: format!("  {} Exit navigation", style("✘").red()),
         action: NavigationAction::Exit,
     });
 
@@ -141,8 +214,8 @@ pub fn interactive_stack_navigation(
     prompt: &str,
 ) -> Result<NavigationAction> {
     let selection = Select::new(prompt, options.to_vec())
-        .with_help_message("Use arrows to navigate, type to search, Enter to select")
-        .with_page_size(15)
+        .with_help_message("↑↓ navigate • type to search • Enter to select • Ctrl+C to exit")
+        .with_page_size(20)
         .prompt()?;
 
     // Return the action from the selected option
@@ -150,31 +223,45 @@ pub fn interactive_stack_navigation(
 }
 
 pub fn print_success(message: &str) {
-    println!("{} {}", style("✅").bold().green(), message);
+    println!("{} {}", style("✔").bold().green(), message);
 }
 
 pub fn print_warning(message: &str) {
-    println!("{} {}", style("⚠️ ").bold().yellow(), message);
+    println!("{} {}", style("⚠").bold().yellow(), message);
 }
 
 pub fn print_error(message: &str) {
-    println!("{} {}", style("❌").bold().red(), message);
+    println!("{} {}", style("✘").bold().red(), message);
 }
 
 pub fn print_info(message: &str) {
-    println!("{} {}", style("ℹ️ ").bold().blue(), message);
+    println!("{} {}", style("ℹ").bold().blue(), message);
 }
 
 pub fn print_train_header(title: &str) {
     let term = Term::stdout();
     let width = term.size().1 as usize;
-    let border = "═".repeat(width.min(80));
+    let border_width = width.min(80);
+    let border = "═".repeat(border_width);
 
     println!("{}", style(&border).bold().cyan());
+    
+    // Center the title with train symbols
+    let title_content = format!(" ▶ {} ◀ ", title);
+    let padding = if border_width > title_content.len() {
+        (border_width - title_content.len()) / 2
+    } else {
+        0
+    };
+    let left_pad = " ".repeat(padding);
+    let right_pad = " ".repeat(border_width.saturating_sub(title_content.len() + padding));
+    
     println!(
-        "{} 🚂 {} 🚂 {}",
+        "{}{}{}{}{}",
         style("║").bold().cyan(),
-        style(title).bold().white(),
+        left_pad,
+        style(&title_content).bold().white(),
+        right_pad,
         style("║").bold().cyan()
     );
     println!("{}", style(&border).bold().cyan());
