@@ -1,46 +1,152 @@
 use anyhow::Result;
 use console::{style, Term};
-use dialoguer::{Confirm, Select, Editor, Input};
+use inquire::{Confirm, Select, Text, Editor};
 use std::process::Command;
 use tracing::{info, warn, error};
 
 pub fn confirm_action(message: &str) -> Result<bool> {
-    let confirmation = Confirm::new()
-        .with_prompt(message)
-        .default(false)
-        .interact()?;
+    let confirmation = Confirm::new(message)
+        .with_default(false)
+        .prompt()?;
     
     Ok(confirmation)
 }
 
-pub fn select_from_list<T: ToString>(items: &[T], prompt: &str) -> Result<usize> {
-    let selection = Select::new()
-        .with_prompt(prompt)
-        .items(items)
-        .default(0)
-        .interact()?;
+pub fn select_from_list<T: ToString + Clone>(items: &[T], prompt: &str) -> Result<usize> {
+    let string_items: Vec<String> = items.iter().map(|item| item.to_string()).collect();
+    let selection = Select::new(prompt, string_items)
+        .with_page_size(15)
+        .prompt()?;
     
-    Ok(selection)
+    // Find the index of the selected item
+    let selected_string = selection;
+    for (i, item) in items.iter().enumerate() {
+        if item.to_string() == selected_string {
+            return Ok(i);
+        }
+    }
+    
+    // This shouldn't happen, but fallback to 0
+    Ok(0)
+}
+
+pub fn fuzzy_select_from_list<T: ToString + Clone>(items: &[T], prompt: &str) -> Result<usize> {
+    // The regular Select prompt already has fuzzy filtering enabled by default
+    select_from_list(items, prompt)
 }
 
 pub fn get_user_input(prompt: &str, default: Option<&str>) -> Result<String> {
-    let mut input = Input::new()
-        .with_prompt(prompt);
+    let mut input = Text::new(prompt);
     
     if let Some(default_value) = default {
-        input = input.default(default_value.to_string());
+        input = input.with_default(default_value);
     }
     
-    let result = input.interact_text()?;
+    let result = input.prompt()?;
     Ok(result)
 }
 
 pub fn open_editor(initial_content: Option<&str>) -> Result<String> {
-    let content = Editor::new()
-        .edit(initial_content.unwrap_or(""))? 
-        .unwrap_or_default();
+    let content = Editor::new("Enter your text:")
+        .with_predefined_text(initial_content.unwrap_or(""))
+        .prompt()?;
     
     Ok(content)
+}
+
+#[derive(Debug, Clone)]
+pub struct NavigationOption {
+    pub display: String,
+    pub action: NavigationAction,
+}
+
+#[derive(Debug, Clone)]
+pub enum NavigationAction {
+    SwitchToBranch(String),
+    ShowBranchInfo(String),
+    CreateMR(String),
+    ViewMR(String, u64),
+    RefreshStatus,
+    Exit,
+}
+
+impl std::fmt::Display for NavigationOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display)
+    }
+}
+
+pub fn create_navigation_options(
+    branches: &[String], 
+    current_branch: Option<&str>,
+    branch_mrs: &std::collections::HashMap<String, u64>
+) -> Vec<NavigationOption> {
+    let mut options = Vec::new();
+    
+    // Add branch navigation options
+    for branch in branches {
+        let is_current = current_branch.map_or(false, |current| current == branch);
+        let mr_info = if let Some(mr_iid) = branch_mrs.get(branch) {
+            format!(" [MR !{}]", mr_iid)
+        } else {
+            String::new()
+        };
+        
+        let display = if is_current {
+            format!("🔸 {} (current){}", branch, mr_info)
+        } else {
+            format!("📋 {}{}", branch, mr_info)
+        };
+        
+        options.push(NavigationOption {
+            display: display.clone(),
+            action: NavigationAction::SwitchToBranch(branch.clone()),
+        });
+        
+        // Add additional actions for each branch
+        options.push(NavigationOption {
+            display: format!("  ℹ️  Show info for {}", branch),
+            action: NavigationAction::ShowBranchInfo(branch.clone()),
+        });
+        
+        if let Some(mr_iid) = branch_mrs.get(branch) {
+            options.push(NavigationOption {
+                display: format!("  🔗 View MR !{} for {}", mr_iid, branch),
+                action: NavigationAction::ViewMR(branch.clone(), *mr_iid),
+            });
+        } else {
+            options.push(NavigationOption {
+                display: format!("  ➕ Create MR for {}", branch),
+                action: NavigationAction::CreateMR(branch.clone()),
+            });
+        }
+    }
+    
+    // Add utility options
+    options.push(NavigationOption {
+        display: "🔄 Refresh status".to_string(),
+        action: NavigationAction::RefreshStatus,
+    });
+    
+    options.push(NavigationOption {
+        display: "❌ Exit navigation".to_string(),
+        action: NavigationAction::Exit,
+    });
+    
+    options
+}
+
+pub fn interactive_stack_navigation(
+    options: &[NavigationOption],
+    prompt: &str
+) -> Result<NavigationAction> {
+    let selection = Select::new(prompt, options.to_vec())
+        .with_help_message("Use arrows to navigate, type to search, Enter to select")
+        .with_page_size(15)
+        .prompt()?;
+    
+    // Return the action from the selected option
+    Ok(selection.action.clone())
 }
 
 pub fn print_success(message: &str) {

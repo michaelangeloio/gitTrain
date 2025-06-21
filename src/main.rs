@@ -55,6 +55,9 @@ async fn main() -> Result<()> {
         Commands::Switch { stack } => {
             stack_manager.switch_stack(&stack).await?;
         }
+        Commands::Navigate => {
+            stack_manager.navigate_stack_interactively().await?;
+        }
         Commands::Delete { stack, force } => {
             stack_manager.delete_stack(&stack, force).await?;
         }

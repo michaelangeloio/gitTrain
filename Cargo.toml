@@ -1,11 +1,11 @@
 [package]
-name = "git-train"
+name = "gittrain"
 version = "0.1.0"
 edition = "2021"
 description = "Simple stack diff CLI tool"
 
 [[bin]]
-name = "git-train"
+name = "gittrain"
 path = "src/main.rs"
 
 [dependencies]
@@ -16,7 +16,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 console = "0.15"
-dialoguer = "0.11"
+inquire = { version = "0.7.5", features = ["fuzzy", "editor"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 chrono = { version = "0.4", features = ["serde"] }

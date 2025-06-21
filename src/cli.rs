@@ -52,6 +52,9 @@ pub enum Commands {
         stack: String,
     },
 
+    /// Interactive navigation through the stack
+    Navigate,
+
     /// Delete a stack
     Delete {
         /// Stack name or ID

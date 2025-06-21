@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::utils::{
     run_git_command, print_success, print_warning, print_error, print_info, 
     print_train_header, sanitize_branch_name, confirm_action, get_user_input,
-    create_backup_name
+    create_backup_name, NavigationAction, create_navigation_options, interactive_stack_navigation
 };
 use crate::gitlab::{GitLabClient, CreateMergeRequestRequest, GitLabProject};
 use crate::errors::TrainError;
@@ -688,6 +688,239 @@ impl StackManager {
         }
 
         Ok(())
+    }
+
+    pub async fn navigate_stack_interactively(&mut self) -> Result<()> {
+        use crate::utils::{NavigationAction, create_navigation_options, interactive_stack_navigation};
+        
+        // Ensure GitLab project is detected if GitLab client is available
+        if let Some(gitlab_client) = &mut self.gitlab_client {
+            if gitlab_client.get_project_details().is_none() {
+                print_info("Detecting GitLab project...");
+                match gitlab_client.detect_and_cache_project().await {
+                    Ok(project) => {
+                        print_success(&format!("Detected GitLab project: {}/{}", 
+                            project.namespace.path, project.path));
+                    }
+                    Err(_) => {
+                        print_warning("Could not auto-detect GitLab project. Some features may be limited.");
+                    }
+                }
+            }
+        }
+        
+        loop {
+            // Load current stack state
+            let stack = match self.load_current_stack() {
+                Ok(stack) => {
+                    self.current_stack = Some(stack.clone());
+                    stack
+                }
+                Err(_) => {
+                    print_warning("No active stack found. Please create or switch to a stack first.");
+                    return Ok(());
+                }
+            };
+
+            print_train_header(&format!("Navigate Stack: {}", stack.name));
+
+            // Get current git branch
+            let current_git_branch = self.get_current_branch().ok();
+            
+            // Collect all branches in the stack
+            let mut branches: Vec<String> = stack.branches.keys().cloned().collect();
+            branches.sort();
+
+            // Collect MR information
+            let mut branch_mrs = std::collections::HashMap::new();
+            for (branch_name, branch) in &stack.branches {
+                if let Some(mr_iid) = branch.mr_iid {
+                    branch_mrs.insert(branch_name.clone(), mr_iid);
+                }
+            }
+
+            // Create navigation options
+            let options = create_navigation_options(
+                &branches,
+                current_git_branch.as_deref(),
+                &branch_mrs
+            );
+
+            // Show interactive menu
+            match interactive_stack_navigation(&options, "Select an action:") {
+                Ok(action) => {
+                    match action {
+                        NavigationAction::SwitchToBranch(branch_name) => {
+                            if let Err(e) = self.switch_to_branch(&branch_name).await {
+                                print_error(&format!("Failed to switch to branch {}: {}", branch_name, e));
+                            }
+                        }
+                        NavigationAction::ShowBranchInfo(branch_name) => {
+                            self.show_branch_info(&branch_name, &stack).await;
+                        }
+                        NavigationAction::CreateMR(branch_name) => {
+                            if let Err(e) = self.create_mr_for_branch(&branch_name, &stack).await {
+                                print_error(&format!("Failed to create MR for {}: {}", branch_name, e));
+                            }
+                        }
+                        NavigationAction::ViewMR(branch_name, mr_iid) => {
+                            self.view_mr_info(&branch_name, mr_iid, &stack).await;
+                        }
+                        NavigationAction::RefreshStatus => {
+                            // Just continue the loop to refresh
+                            continue;
+                        }
+                        NavigationAction::Exit => {
+                            print_info("Exiting navigation");
+                            break;
+                        }
+                    }
+                }
+                Err(_e) => {
+                    // User cancelled (Ctrl+C or ESC)
+                    print_info("Navigation cancelled");
+                    break;
+                }
+            }
+
+            // Add a small pause for better UX
+            println!();
+        }
+
+        Ok(())
+    }
+
+    async fn switch_to_branch(&self, branch_name: &str) -> Result<()> {
+        // Ensure working directory is clean
+        if let Err(_) = self.ensure_clean_working_directory() {
+            print_warning("Working directory is not clean. Stashing changes...");
+            run_git_command(&["stash", "push", "-m", "git-train navigation stash"])?;
+        }
+
+        // Switch to the branch
+        run_git_command(&["checkout", branch_name])?;
+        print_success(&format!("Switched to branch: {}", branch_name));
+        
+        Ok(())
+    }
+
+    async fn show_branch_info(&self, branch_name: &str, stack: &Stack) {
+        print_train_header(&format!("Branch Info: {}", branch_name));
+        
+        if let Some(branch) = stack.branches.get(branch_name) {
+            println!("Branch: {}", branch.name);
+            println!("Parent: {}", branch.parent.as_deref().unwrap_or(&stack.base_branch));
+            println!("Commit: {}", &branch.commit_hash[..8]);
+            println!("Created: {}", branch.created_at.format("%Y-%m-%d %H:%M:%S UTC"));
+            println!("Updated: {}", branch.updated_at.format("%Y-%m-%d %H:%M:%S UTC"));
+            
+            if let Some(mr_iid) = branch.mr_iid {
+                println!("Merge Request: !{}", mr_iid);
+                if let Some(project) = &stack.gitlab_project {
+                    println!("MR URL: {}/merge_requests/{}", project.web_url, mr_iid);
+                }
+            } else {
+                println!("Merge Request: Not created");
+            }
+
+            // Show children if any
+            let hierarchy = self.build_branch_hierarchy(stack);
+            if let Some(children) = hierarchy.get(branch_name) {
+                if !children.is_empty() {
+                    println!("Children: {}", children.join(", "));
+                }
+            }
+
+            // Show commit info
+            if let Ok(commit_info) = run_git_command(&["show", "--oneline", "-s", &branch.commit_hash]) {
+                println!("Commit info: {}", commit_info);
+            }
+        } else {
+            print_error(&format!("Branch '{}' not found in stack", branch_name));
+        }
+        
+        println!("\nPress Enter to continue...");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+
+    async fn create_mr_for_branch(&mut self, branch_name: &str, stack: &Stack) -> Result<()> {
+        if let Some(gitlab_client) = &self.gitlab_client {
+            if let Some(branch) = stack.branches.get(branch_name) {
+                let mut stack_mut = stack.clone();
+                self.create_or_update_mr_with_smart_targeting_and_store(
+                    gitlab_client,
+                    branch_name,
+                    branch,
+                    &mut stack_mut
+                ).await?;
+                
+                // Save the updated stack
+                self.save_stack_state(&stack_mut)?;
+                self.current_stack = Some(stack_mut);
+                
+                print_success(&format!("MR creation initiated for branch: {}", branch_name));
+            } else {
+                print_error(&format!("Branch '{}' not found in stack", branch_name));
+            }
+        } else {
+            print_error("GitLab client not available. Configure GitLab integration first.");
+        }
+        Ok(())
+    }
+
+    async fn view_mr_info(&self, branch_name: &str, mr_iid: u64, stack: &Stack) {
+        print_train_header(&format!("MR Info: !{} ({})", mr_iid, branch_name));
+        
+        if let Some(gitlab_client) = &self.gitlab_client {
+            // Check if we have project details
+            if gitlab_client.get_project_details().is_none() {
+                print_warning("GitLab project not detected. Please ensure:");
+                println!("  • You have a GitLab remote configured");
+                println!("  • GITLAB_TOKEN environment variable is set");
+                println!("  • GITLAB_URL is set (if not using gitlab.com)");
+                println!("  • Or set GITLAB_PROJECT_ID environment variable");
+                println!("\nPress Enter to continue...");
+                let _ = std::io::stdin().read_line(&mut String::new());
+                return;
+            }
+
+            match gitlab_client.get_merge_request(mr_iid).await {
+                Ok(mr) => {
+                    println!("Title: {}", mr.title);
+                    println!("State: {}", mr.state);
+                    println!("Source: {}", mr.source_branch);
+                    println!("Target: {}", mr.target_branch);
+                    println!("ID: {}", mr.id);
+                    println!("IID: {}", mr.iid);
+                    
+                    if let Some(project) = &stack.gitlab_project {
+                        println!("URL: {}/merge_requests/{}", project.web_url, mr.iid);
+                    } else if let Some(project) = gitlab_client.get_project_details() {
+                        println!("URL: {}/merge_requests/{}", project.web_url, mr.iid);
+                    }
+                    
+                    if let Some(description) = &mr.description {
+                        if !description.is_empty() {
+                            println!("\nDescription:");
+                            println!("{}", description);
+                        }
+                    }
+                }
+                Err(e) => {
+                    print_error(&format!("Failed to fetch MR info: {}", e));
+                    if e.to_string().contains("404") {
+                        print_info(&format!("MR !{} may have been deleted or moved", mr_iid));
+                    }
+                }
+            }
+        } else {
+            print_error("GitLab client not available. Please check your GitLab configuration:");
+            println!("  • Set GITLAB_TOKEN environment variable");
+            println!("  • Set GITLAB_URL (if not using gitlab.com)");
+        }
+        
+        println!("\nPress Enter to continue...");
+        let _ = std::io::stdin().read_line(&mut String::new());
     }
 
     pub async fn push_stack(&mut self) -> Result<()> {
