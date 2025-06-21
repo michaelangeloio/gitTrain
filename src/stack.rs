@@ -1,21 +1,20 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use tracing::{info, warn, error};
-use chrono::{DateTime, Utc};
+use tracing::info;
 use uuid::Uuid;
 
-use crate::utils::{
-    run_git_command, print_success, print_warning, print_error, print_info, 
-    print_train_header, sanitize_branch_name, confirm_action, get_user_input,
-    create_backup_name, NavigationAction, create_navigation_options, interactive_stack_navigation, MrStatusInfo
-};
-use crate::gitlab::{GitLabClient, CreateMergeRequestRequest, GitLabProject};
-use crate::errors::TrainError;
 use crate::config::TrainConfig;
 use crate::conflict::{ConflictResolver, GitState};
+use crate::errors::TrainError;
+use crate::gitlab::{CreateMergeRequestRequest, GitLabClient, GitLabProject};
+use crate::utils::{
+    confirm_action, create_backup_name, get_user_input, print_error, print_info, print_success,
+    print_train_header, print_warning, run_git_command, sanitize_branch_name, MrStatusInfo,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StackBranch {
@@ -41,7 +40,6 @@ pub struct Stack {
 }
 
 pub struct StackManager {
-    git_dir: PathBuf,
     train_dir: PathBuf,
     current_stack: Option<Stack>,
     gitlab_client: Option<GitLabClient>,
@@ -50,15 +48,10 @@ pub struct StackManager {
 }
 
 impl StackManager {
-    pub async fn new() -> Result<Self> {
-        let config = TrainConfig::default();
-        Self::new_with_config(config).await
-    }
-
     pub async fn new_with_config(config: TrainConfig) -> Result<Self> {
         let git_dir = Self::find_git_dir()?;
         let train_dir = git_dir.join("train");
-        
+
         // Create train directory if it doesn't exist
         if !train_dir.exists() {
             fs::create_dir_all(&train_dir)?;
@@ -81,7 +74,6 @@ impl StackManager {
         let conflict_resolver = ConflictResolver::new(config.clone(), git_dir.clone());
 
         Ok(Self {
-            git_dir,
             train_dir,
             current_stack: None,
             gitlab_client,
@@ -120,38 +112,66 @@ impl StackManager {
             Err(_) => {
                 // Check if we have conflicts
                 if let Some(conflicts) = self.conflict_resolver.detect_conflicts()? {
-                    print_info(&format!("Conflicts detected during rebase of {} onto {}", branch, onto));
-                    
+                    print_info(&format!(
+                        "Conflicts detected during rebase of {} onto {}",
+                        branch, onto
+                    ));
+
                     // Try automatic resolution first
-                    if self.conflict_resolver.auto_resolve_conflicts(&conflicts).await? {
+                    if self
+                        .conflict_resolver
+                        .auto_resolve_conflicts(&conflicts)
+                        .await?
+                    {
                         // Continue the rebase
                         run_git_command(&["rebase", "--continue"])?;
-                        print_success(&format!("Auto-resolved conflicts and completed rebase"));
+                        print_success("Auto-resolved conflicts and completed rebase");
                         Ok(())
                     } else {
                         // Fall back to interactive resolution
                         match self.config.conflict_resolution.auto_resolve_strategy {
                             crate::config::AutoResolveStrategy::Never => {
-                                print_warning("Auto-resolution disabled. Please resolve conflicts manually:");
-                                print_info(&format!("Run 'git-train resolve interactive' to resolve conflicts"));
-                                print_info(&format!("Then run 'git-train resolve continue' to complete the rebase"));
+                                print_warning(
+                                    "Auto-resolution disabled. Please resolve conflicts manually:",
+                                );
+                                print_info(
+                                    "Run 'git-train resolve interactive' to resolve conflicts",
+                                );
+                                print_info(
+                                    "Then run 'git-train resolve continue' to complete the rebase",
+                                );
                                 Err(TrainError::InvalidState {
                                     message: format!("Manual conflict resolution required for rebase of {} onto {}", branch, onto),
                                 }.into())
                             }
                             _ => {
                                 // Offer interactive resolution with better error handling
-                                match self.conflict_resolver.resolve_conflicts_interactively(&conflicts).await {
+                                match self
+                                    .conflict_resolver
+                                    .resolve_conflicts_interactively(&conflicts)
+                                    .await
+                                {
                                     Ok(_) => Ok(()),
                                     Err(e) => {
-                                        print_error(&format!("Interactive conflict resolution failed: {}", e));
+                                        print_error(&format!(
+                                            "Interactive conflict resolution failed: {}",
+                                            e
+                                        ));
                                         print_info("Resolution options:");
-                                        print_info("• Run 'git-train resolve interactive' to try again");
-                                        print_info("• Run 'git-train resolve abort' to cancel the rebase");
+                                        print_info(
+                                            "• Run 'git-train resolve interactive' to try again",
+                                        );
+                                        print_info(
+                                            "• Run 'git-train resolve abort' to cancel the rebase",
+                                        );
                                         print_info("• Resolve conflicts manually and run 'git-train resolve continue'");
                                         Err(TrainError::InvalidState {
-                                            message: format!("Rebase of {} onto {} requires manual intervention", branch, onto),
-                                        }.into())
+                                            message: format!(
+                                                "Rebase of {} onto {} requires manual intervention",
+                                                branch, onto
+                                            ),
+                                        }
+                                        .into())
                                     }
                                 }
                             }
@@ -161,7 +181,8 @@ impl StackManager {
                     // Rebase failed for other reasons
                     Err(TrainError::GitError {
                         message: format!("Rebase of {} onto {} failed", branch, onto),
-                    }.into())
+                    }
+                    .into())
                 }
             }
         }
@@ -170,13 +191,14 @@ impl StackManager {
     fn find_git_dir() -> Result<PathBuf> {
         let output = run_git_command(&["rev-parse", "--git-dir"])?;
         let git_dir = PathBuf::from(output.trim());
-        
+
         if !git_dir.exists() {
             return Err(TrainError::GitError {
                 message: "Not in a git repository".to_string(),
-            }.into());
+            }
+            .into());
         }
-        
+
         Ok(git_dir.canonicalize()?)
     }
 
@@ -198,8 +220,10 @@ impl StackManager {
             print_info("Detecting GitLab project...");
             match gitlab_client.detect_and_cache_project().await {
                 Ok(project) => {
-                    print_success(&format!("Detected GitLab project: {}/{}", 
-                        project.namespace.path, project.path));
+                    print_success(&format!(
+                        "Detected GitLab project: {}/{}",
+                        project.namespace.path, project.path
+                    ));
                     print_info(&format!("Project URL: {}", project.web_url));
                     Some(project.clone())
                 }
@@ -241,8 +265,14 @@ impl StackManager {
         self.save_stack_state(&stack)?;
         self.current_stack = Some(stack);
 
-        print_success(&format!("Created stack '{}' with base branch '{}'", sanitized_name, base_branch));
-        print_info(&format!("Current branch '{}' added to stack", current_branch));
+        print_success(&format!(
+            "Created stack '{}' with base branch '{}'",
+            sanitized_name, base_branch
+        ));
+        print_info(&format!(
+            "Current branch '{}' added to stack",
+            current_branch
+        ));
 
         Ok(())
     }
@@ -256,8 +286,12 @@ impl StackManager {
         // Ensure the current branch is part of the stack
         if !stack.branches.contains_key(&current_branch) {
             return Err(TrainError::StackError {
-                message: format!("Branch '{}' is not part of the current stack", current_branch),
-            }.into());
+                message: format!(
+                    "Branch '{}' is not part of the current stack",
+                    current_branch
+                ),
+            }
+            .into());
         }
 
         // Check if there are changes to commit
@@ -287,7 +321,8 @@ impl StackManager {
         updated_stack.updated_at = Utc::now();
 
         // Propagate changes to dependent branches
-        self.propagate_changes(&mut updated_stack, &current_branch).await?;
+        self.propagate_changes(&mut updated_stack, &current_branch)
+            .await?;
 
         // Save the updated stack
         self.save_stack_state(&updated_stack)?;
@@ -307,8 +342,12 @@ impl StackManager {
         // Ensure the current branch is part of the stack
         if !stack.branches.contains_key(&current_branch) {
             return Err(TrainError::StackError {
-                message: format!("Branch '{}' is not part of the current stack", current_branch),
-            }.into());
+                message: format!(
+                    "Branch '{}' is not part of the current stack",
+                    current_branch
+                ),
+            }
+            .into());
         }
 
         // Create a backup before making changes
@@ -349,7 +388,8 @@ impl StackManager {
 
         // Propagate changes to dependent branches (resync downstream)
         print_info("Resyncing downstream branches...");
-        self.propagate_changes(&mut updated_stack, &current_branch).await?;
+        self.propagate_changes(&mut updated_stack, &current_branch)
+            .await?;
 
         // Save the updated stack
         self.save_stack_state(&updated_stack)?;
@@ -364,53 +404,58 @@ impl StackManager {
     async fn detect_smart_parent(&self, current_branch: &str, stack: &Stack) -> Result<String> {
         // Get the commits in the current branch that are not in the base branch
         let commits_output = run_git_command(&[
-            "rev-list", 
+            "rev-list",
             &format!("{}..{}", stack.base_branch, current_branch),
-            "--reverse"
+            "--reverse",
         ])?;
-        
+
         let commits: Vec<&str> = commits_output.trim().lines().collect();
-        
+
         if commits.is_empty() {
             // No commits beyond base branch, parent should be base branch
             return Ok(stack.base_branch.clone());
         }
-        
+
         // Check each stack branch to see which one contains the most commits from our branch
         let mut best_parent = stack.base_branch.clone();
         let mut max_shared_commits = 0;
-        
-        for (branch_name, branch) in &stack.branches {
+
+        for branch_name in stack.branches.keys() {
             // Get commits in this stack branch
             let branch_commits_output = run_git_command(&[
                 "rev-list",
-                &format!("{}..{}", stack.base_branch, branch_name)
+                &format!("{}..{}", stack.base_branch, branch_name),
             ])?;
-            
-            let branch_commits: std::collections::HashSet<&str> = branch_commits_output
-                .trim()
-                .lines()
-                .collect();
-            
+
+            let branch_commits: std::collections::HashSet<&str> =
+                branch_commits_output.trim().lines().collect();
+
             // Count how many of our commits are in this branch
-            let shared_commits = commits.iter()
+            let shared_commits = commits
+                .iter()
                 .filter(|commit| branch_commits.contains(*commit))
                 .count();
-            
+
             // If this branch contains more of our commits, it's a better parent candidate
             if shared_commits > max_shared_commits {
                 max_shared_commits = shared_commits;
                 best_parent = branch_name.clone();
             }
         }
-        
+
         // If we found a stack branch that shares commits, use it
         if max_shared_commits > 0 {
-            print_info(&format!("Detected '{}' as parent (shares {} commits)", best_parent, max_shared_commits));
+            print_info(&format!(
+                "Detected '{}' as parent (shares {} commits)",
+                best_parent, max_shared_commits
+            ));
             Ok(best_parent)
         } else {
             // No shared commits with any stack branch, use base branch
-            print_info(&format!("No shared commits with stack branches, using base branch '{}'", stack.base_branch));
+            print_info(&format!(
+                "No shared commits with stack branches, using base branch '{}'",
+                stack.base_branch
+            ));
             Ok(stack.base_branch.clone())
         }
     }
@@ -423,7 +468,10 @@ impl StackManager {
 
         // Check if branch is already in the stack
         if stack.branches.contains_key(&current_branch) {
-            print_warning(&format!("Branch '{}' is already part of the stack", current_branch));
+            print_warning(&format!(
+                "Branch '{}' is already part of the stack",
+                current_branch
+            ));
             return Ok(());
         }
 
@@ -431,13 +479,14 @@ impl StackManager {
         self.ensure_clean_working_directory()?;
 
         let current_commit = self.get_current_commit_hash()?;
-        
+
         // Determine the parent branch
         let parent_branch = if let Some(parent) = parent {
             if !stack.branches.contains_key(parent) && parent != stack.base_branch {
                 return Err(TrainError::StackError {
                     message: format!("Parent branch '{}' is not part of the stack", parent),
-                }.into());
+                }
+                .into());
             }
             parent.to_string()
         } else {
@@ -463,7 +512,10 @@ impl StackManager {
         self.save_stack_state(&stack)?;
         self.current_stack = Some(stack);
 
-        print_success(&format!("Added branch '{}' to stack with parent '{}'", current_branch, parent_branch));
+        print_success(&format!(
+            "Added branch '{}' to stack with parent '{}'",
+            current_branch, parent_branch
+        ));
 
         Ok(())
     }
@@ -496,16 +548,21 @@ impl StackManager {
         for stack_file in stack_files {
             if let Ok(stack_json) = std::fs::read_to_string(&stack_file) {
                 if let Ok(stack) = serde_json::from_str::<Stack>(&stack_json) {
-                    let is_current = if current_stack_id == stack.id { " (current)" } else { "" };
+                    let is_current = if current_stack_id == stack.id {
+                        " (current)"
+                    } else {
+                        ""
+                    };
                     let project_info = if let Some(project) = &stack.gitlab_project {
                         format!(" | Project: {}/{}", project.namespace.path, project.path)
                     } else {
                         String::new()
                     };
-                    
+
                     println!("📋 {} ({}){}", stack.name, &stack.id[..8], is_current);
-                    println!("   └─ Base: {} | Branches: {} | Updated: {}{}", 
-                        stack.base_branch, 
+                    println!(
+                        "   └─ Base: {} | Branches: {} | Updated: {}{}",
+                        stack.base_branch,
                         stack.branches.len(),
                         stack.updated_at.format("%Y-%m-%d %H:%M"),
                         project_info
@@ -528,8 +585,12 @@ impl StackManager {
 
         self.current_stack = Some(stack.clone());
 
-        print_success(&format!("Switched to stack '{}' ({})", stack.name, &stack.id[..8]));
-        
+        print_success(&format!(
+            "Switched to stack '{}' ({})",
+            stack.name,
+            &stack.id[..8]
+        ));
+
         // Show status of the new stack
         self.show_status().await?;
 
@@ -544,22 +605,32 @@ impl StackManager {
 
         // Check if this is the current stack
         let current_file = self.train_dir.join("current.json");
-        let is_current_stack = if let Ok(current_stack_id) = std::fs::read_to_string(&current_file) {
+        let is_current_stack = if let Ok(current_stack_id) = std::fs::read_to_string(&current_file)
+        {
             current_stack_id.trim() == stack.id
         } else {
             false
         };
 
         // Show what will be deleted
-        print_warning(&format!("This will permanently delete stack '{}' ({})", stack.name, &stack.id[..8]));
-        print_info(&format!("Stack contains {} branches:", stack.branches.len()));
+        print_warning(&format!(
+            "This will permanently delete stack '{}' ({})",
+            stack.name,
+            &stack.id[..8]
+        ));
+        print_info(&format!(
+            "Stack contains {} branches:",
+            stack.branches.len()
+        ));
         for branch_name in stack.branches.keys() {
             println!("  - {}", branch_name);
         }
 
         if let Some(project) = &stack.gitlab_project {
-            print_info(&format!("Associated with GitLab project: {}/{}", 
-                project.namespace.path, project.path));
+            print_info(&format!(
+                "Associated with GitLab project: {}/{}",
+                project.namespace.path, project.path
+            ));
         }
 
         if is_current_stack {
@@ -568,7 +639,9 @@ impl StackManager {
 
         // Confirm deletion unless forced
         if !force {
-            print_warning("Are you sure you want to delete this stack? This action cannot be undone.");
+            print_warning(
+                "Are you sure you want to delete this stack? This action cannot be undone.",
+            );
             let confirmed = get_user_input("Type 'yes' to confirm deletion", None)?;
             if confirmed.to_lowercase() != "yes" {
                 print_info("Stack deletion cancelled");
@@ -597,20 +670,28 @@ impl StackManager {
 
     pub async fn show_status(&mut self) -> Result<()> {
         print_train_header("Stack Status");
-        
+
         let stack = self.get_or_load_current_stack()?;
 
         println!("Stack: {} ({})", stack.name, &stack.id[..8]);
         println!("Base branch: {}", stack.base_branch);
-        
+
         if let Some(project) = &stack.gitlab_project {
-            println!("GitLab project: {}/{} (ID: {})", 
-                project.namespace.path, project.path, project.id);
+            println!(
+                "GitLab project: {}/{} (ID: {})",
+                project.namespace.path, project.path, project.id
+            );
             println!("Project URL: {}", project.web_url);
         }
-        
-        println!("Created: {}", stack.created_at.format("%Y-%m-%d %H:%M:%S UTC"));
-        println!("Updated: {}", stack.updated_at.format("%Y-%m-%d %H:%M:%S UTC"));
+
+        println!(
+            "Created: {}",
+            stack.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+        println!(
+            "Updated: {}",
+            stack.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
+        );
         println!();
 
         // Build branch hierarchy and collect MR status
@@ -629,8 +710,10 @@ impl StackManager {
     }
 
     pub async fn navigate_stack_interactively(&mut self) -> Result<()> {
-        use crate::utils::{NavigationAction, create_navigation_options, interactive_stack_navigation, MrStatusInfo};
-        
+        use crate::utils::{
+            create_navigation_options, interactive_stack_navigation, NavigationAction,
+        };
+
         loop {
             // Load current stack state
             let stack = match self.load_current_stack() {
@@ -639,7 +722,9 @@ impl StackManager {
                     stack
                 }
                 Err(_) => {
-                    print_warning("No active stack found. Please create or switch to a stack first.");
+                    print_warning(
+                        "No active stack found. Please create or switch to a stack first.",
+                    );
                     return Ok(());
                 }
             };
@@ -648,7 +733,7 @@ impl StackManager {
 
             // Get current git branch
             let current_git_branch = self.get_current_branch().ok();
-            
+
             // Collect all branches in the stack
             let mut branches: Vec<String> = stack.branches.keys().cloned().collect();
             branches.sort();
@@ -660,7 +745,7 @@ impl StackManager {
             let options = create_navigation_options(
                 &branches,
                 current_git_branch.as_deref(),
-                &branch_mr_status
+                &branch_mr_status,
             );
 
             // Show interactive menu
@@ -669,7 +754,10 @@ impl StackManager {
                     match action {
                         NavigationAction::SwitchToBranch(branch_name) => {
                             if let Err(e) = self.switch_to_branch(&branch_name).await {
-                                print_error(&format!("Failed to switch to branch {}: {}", branch_name, e));
+                                print_error(&format!(
+                                    "Failed to switch to branch {}: {}",
+                                    branch_name, e
+                                ));
                             }
                         }
                         NavigationAction::ShowBranchInfo(branch_name) => {
@@ -677,7 +765,10 @@ impl StackManager {
                         }
                         NavigationAction::CreateMR(branch_name) => {
                             if let Err(e) = self.create_mr_for_branch(&branch_name, &stack).await {
-                                print_error(&format!("Failed to create MR for {}: {}", branch_name, e));
+                                print_error(&format!(
+                                    "Failed to create MR for {}: {}",
+                                    branch_name, e
+                                ));
                             }
                         }
                         NavigationAction::ViewMR(branch_name, mr_iid) => {
@@ -693,7 +784,7 @@ impl StackManager {
                         }
                     }
                 }
-                Err(e) => {
+                Err(_) => {
                     // User cancelled (Ctrl+C or ESC)
                     print_info("Navigation cancelled");
                     break;
@@ -709,7 +800,7 @@ impl StackManager {
 
     async fn switch_to_branch(&self, branch_name: &str) -> Result<()> {
         // Ensure working directory is clean
-        if let Err(_) = self.ensure_clean_working_directory() {
+        if self.ensure_clean_working_directory().is_err() {
             print_warning("Working directory is not clean. Stashing changes...");
             run_git_command(&["stash", "push", "-m", "git-train navigation stash"])?;
         }
@@ -717,20 +808,29 @@ impl StackManager {
         // Switch to the branch
         run_git_command(&["checkout", branch_name])?;
         print_success(&format!("Switched to branch: {}", branch_name));
-        
+
         Ok(())
     }
 
     async fn show_branch_info(&self, branch_name: &str, stack: &Stack) {
         print_train_header(&format!("Branch Info: {}", branch_name));
-        
+
         if let Some(branch) = stack.branches.get(branch_name) {
             println!("Branch: {}", branch.name);
-            println!("Parent: {}", branch.parent.as_deref().unwrap_or(&stack.base_branch));
+            println!(
+                "Parent: {}",
+                branch.parent.as_deref().unwrap_or(&stack.base_branch)
+            );
             println!("Commit: {}", &branch.commit_hash[..8]);
-            println!("Created: {}", branch.created_at.format("%Y-%m-%d %H:%M:%S UTC"));
-            println!("Updated: {}", branch.updated_at.format("%Y-%m-%d %H:%M:%S UTC"));
-            
+            println!(
+                "Created: {}",
+                branch.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+            );
+            println!(
+                "Updated: {}",
+                branch.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
+            );
+
             if let Some(mr_iid) = branch.mr_iid {
                 println!("Merge Request: !{}", mr_iid);
                 if let Some(project) = &stack.gitlab_project {
@@ -749,13 +849,15 @@ impl StackManager {
             }
 
             // Show commit info
-            if let Ok(commit_info) = run_git_command(&["show", "--oneline", "-s", &branch.commit_hash]) {
+            if let Ok(commit_info) =
+                run_git_command(&["show", "--oneline", "-s", &branch.commit_hash])
+            {
                 println!("Commit info: {}", commit_info);
             }
         } else {
             print_error(&format!("Branch '{}' not found in stack", branch_name));
         }
-        
+
         println!("\nPress Enter to continue...");
         let _ = std::io::stdin().read_line(&mut String::new());
     }
@@ -768,14 +870,18 @@ impl StackManager {
                     gitlab_client,
                     branch_name,
                     branch,
-                    &mut stack_mut
-                ).await?;
-                
+                    &mut stack_mut,
+                )
+                .await?;
+
                 // Save the updated stack
                 self.save_stack_state(&stack_mut)?;
                 self.current_stack = Some(stack_mut);
-                
-                print_success(&format!("MR creation initiated for branch: {}", branch_name));
+
+                print_success(&format!(
+                    "MR creation initiated for branch: {}",
+                    branch_name
+                ));
             } else {
                 print_error(&format!("Branch '{}' not found in stack", branch_name));
             }
@@ -787,7 +893,7 @@ impl StackManager {
 
     async fn view_mr_info(&self, branch_name: &str, mr_iid: u64, stack: &Stack) {
         print_train_header(&format!("MR Info: !{} ({})", mr_iid, branch_name));
-        
+
         if let Some(gitlab_client) = &self.gitlab_client {
             match gitlab_client.get_merge_request(mr_iid).await {
                 Ok(mr) => {
@@ -797,11 +903,11 @@ impl StackManager {
                     println!("Target: {}", mr.target_branch);
                     println!("ID: {}", mr.id);
                     println!("IID: {}", mr.iid);
-                    
+
                     if let Some(project) = &stack.gitlab_project {
                         println!("URL: {}/merge_requests/{}", project.web_url, mr.iid);
                     }
-                    
+
                     if let Some(description) = &mr.description {
                         if !description.is_empty() {
                             println!("\nDescription:");
@@ -816,7 +922,7 @@ impl StackManager {
         } else {
             print_error("GitLab client not available");
         }
-        
+
         println!("\nPress Enter to continue...");
         let _ = std::io::stdin().read_line(&mut String::new());
     }
@@ -829,11 +935,15 @@ impl StackManager {
         let mut successful_pushes = Vec::new();
 
         // Push all branches in the stack
-        for (branch_name, branch) in &stack.branches {
+        for branch_name in stack.branches.keys() {
             print_info(&format!("Pushing branch: {}", branch_name));
-            
+
             // First try a normal push
-            match run_git_command(&["push", "origin", &format!("{}:{}", branch_name, branch_name)]) {
+            match run_git_command(&[
+                "push",
+                "origin",
+                &format!("{}:{}", branch_name, branch_name),
+            ]) {
                 Ok(_) => {
                     print_success(&format!("Pushed {}", branch_name));
                     successful_pushes.push(branch_name.clone());
@@ -842,25 +952,45 @@ impl StackManager {
                     // Check if this is a non-fast-forward error (common after rebase)
                     let error_msg = format!("{}", e);
                     if error_msg.contains("non-fast-forward") || error_msg.contains("rejected") {
-                        print_warning(&format!("Branch {} was rejected (non-fast-forward)", branch_name));
-                        print_info("This is common after rebasing. Checking if force-push is safe...");
-                        
+                        print_warning(&format!(
+                            "Branch {} was rejected (non-fast-forward)",
+                            branch_name
+                        ));
+                        print_info(
+                            "This is common after rebasing. Checking if force-push is safe...",
+                        );
+
                         // Check if we should force push safely
                         if self.should_force_push_branch(branch_name, &stack).await? {
-                            match run_git_command(&["push", "--force-with-lease", "origin", &format!("{}:{}", branch_name, branch_name)]) {
+                            match run_git_command(&[
+                                "push",
+                                "--force-with-lease",
+                                "origin",
+                                &format!("{}:{}", branch_name, branch_name),
+                            ]) {
                                 Ok(_) => {
                                     print_success(&format!("Force-pushed {} safely", branch_name));
                                     successful_pushes.push(branch_name.clone());
                                 }
                                 Err(force_err) => {
-                                    print_error(&format!("Force-push failed for {}: {}", branch_name, force_err));
+                                    print_error(&format!(
+                                        "Force-push failed for {}: {}",
+                                        branch_name, force_err
+                                    ));
                                     print_warning("This might mean someone else pushed changes. Manual intervention required.");
-                                    push_failures.push((branch_name.clone(), format!("{}", force_err)));
+                                    push_failures
+                                        .push((branch_name.clone(), format!("{}", force_err)));
                                 }
                             }
                         } else {
-                            print_warning(&format!("Skipping force-push for {} (safety check failed)", branch_name));
-                            push_failures.push((branch_name.clone(), "Force-push deemed unsafe".to_string()));
+                            print_warning(&format!(
+                                "Skipping force-push for {} (safety check failed)",
+                                branch_name
+                            ));
+                            push_failures.push((
+                                branch_name.clone(),
+                                "Force-push deemed unsafe".to_string(),
+                            ));
                         }
                     } else {
                         print_error(&format!("Failed to push {}: {}", branch_name, e));
@@ -872,8 +1002,11 @@ impl StackManager {
 
         // Report results
         if !successful_pushes.is_empty() {
-            print_success(&format!("Successfully pushed {} branches: {}", 
-                successful_pushes.len(), successful_pushes.join(", ")));
+            print_success(&format!(
+                "Successfully pushed {} branches: {}",
+                successful_pushes.len(),
+                successful_pushes.join(", ")
+            ));
         }
 
         if !push_failures.is_empty() {
@@ -888,7 +1021,8 @@ impl StackManager {
         }
 
         // Create or update merge requests with intelligent target branch selection
-        self.process_all_branches_for_mrs(&mut stack, "Updated merge request for").await;
+        self.process_all_branches_for_mrs(&mut stack, "Updated merge request for")
+            .await;
 
         // Save the updated stack with MR IIDs
         self.save_stack_state(&stack)?;
@@ -906,31 +1040,43 @@ impl StackManager {
     /// Determine if it's safe to force-push a branch
     async fn should_force_push_branch(&self, branch_name: &str, stack: &Stack) -> Result<bool> {
         // Safety checks for force-push
-        
+
         // 1. Check if the branch exists remotely
         let remote_exists = run_git_command(&["ls-remote", "--heads", "origin", branch_name])
             .map(|output| !output.trim().is_empty())
             .unwrap_or(false);
-        
+
         if !remote_exists {
             // New branch, safe to push
-            print_info(&format!("Branch {} doesn't exist remotely, safe to push", branch_name));
+            print_info(&format!(
+                "Branch {} doesn't exist remotely, safe to push",
+                branch_name
+            ));
             return Ok(true);
         }
 
         // 2. Check if this branch is part of our stack and we control it
         if !stack.branches.contains_key(branch_name) {
-            print_warning(&format!("Branch {} is not part of our stack, unsafe to force-push", branch_name));
+            print_warning(&format!(
+                "Branch {} is not part of our stack, unsafe to force-push",
+                branch_name
+            ));
             return Ok(false);
         }
 
         // 3. Check configuration for automatic force-push behavior
         if self.config.conflict_resolution.auto_force_push_after_rebase {
-            print_info(&format!("Auto force-push enabled, proceeding with {} (--force-with-lease)", branch_name));
+            print_info(&format!(
+                "Auto force-push enabled, proceeding with {} (--force-with-lease)",
+                branch_name
+            ));
         } else if self.config.conflict_resolution.prompt_before_force_push {
-            print_warning(&format!("Branch {} requires force-push after rebase", branch_name));
+            print_warning(&format!(
+                "Branch {} requires force-push after rebase",
+                branch_name
+            ));
             print_info("This will overwrite the remote branch with your rebased version.");
-            
+
             let proceed = confirm_action(&format!("Force-push {} safely?", branch_name))?;
             if !proceed {
                 print_info("Skipping force-push. You can push manually later if needed.");
@@ -938,16 +1084,26 @@ impl StackManager {
             }
         } else {
             // Neither auto nor prompt enabled, skip force-push
-            print_info(&format!("Force-push not configured for automatic mode, skipping {}", branch_name));
+            print_info(&format!(
+                "Force-push not configured for automatic mode, skipping {}",
+                branch_name
+            ));
             return Ok(false);
         }
 
         // 4. Additional safety: ensure we're not too far ahead (sanity check)
-        match run_git_command(&["rev-list", "--count", &format!("origin/{}..{}", branch_name, branch_name)]) {
+        match run_git_command(&[
+            "rev-list",
+            "--count",
+            &format!("origin/{}..{}", branch_name, branch_name),
+        ]) {
             Ok(output) => {
                 if let Ok(ahead_count) = output.trim().parse::<u32>() {
                     if ahead_count > 20 {
-                        print_warning(&format!("Branch {} is {} commits ahead of remote, this seems unusual", branch_name, ahead_count));
+                        print_warning(&format!(
+                            "Branch {} is {} commits ahead of remote, this seems unusual",
+                            branch_name, ahead_count
+                        ));
                         print_warning("This might indicate a problem. Manual review recommended.");
                         return Ok(false);
                     }
@@ -965,40 +1121,56 @@ impl StackManager {
     /// Check for and attempt to recover from invalid git states
     pub async fn check_and_recover_git_state(&self) -> Result<()> {
         let git_state = self.conflict_resolver.get_git_state()?;
-        
+
         match git_state {
             GitState::Clean => Ok(()),
             GitState::Rebasing | GitState::Merging | GitState::CherryPicking => {
-                print_warning(&format!("Git is in state {:?}. Recovery options:", git_state));
-                
+                print_warning(&format!(
+                    "Git is in state {:?}. Recovery options:",
+                    git_state
+                ));
+
                 if let Some(conflicts) = self.conflict_resolver.detect_conflicts()? {
-                    print_info(&format!("Found {} conflicted files that need resolution", conflicts.files.len()));
+                    print_info(&format!(
+                        "Found {} conflicted files that need resolution",
+                        conflicts.files.len()
+                    ));
                     self.conflict_resolver.print_conflict_summary(&conflicts);
-                    
+
                     let options = vec![
                         "Try to resolve conflicts automatically",
-                        "Resolve conflicts interactively", 
+                        "Resolve conflicts interactively",
                         "Abort the current operation",
-                        "Continue with manual resolution later"
+                        "Continue with manual resolution later",
                     ];
-                    
-                    let choice = crate::utils::select_from_list(&options, "How would you like to proceed?")?;
-                    
+
+                    let choice =
+                        crate::utils::select_from_list(&options, "How would you like to proceed?")?;
+
                     match choice {
                         0 => {
-                            if self.conflict_resolver.auto_resolve_conflicts(&conflicts).await? {
+                            if self
+                                .conflict_resolver
+                                .auto_resolve_conflicts(&conflicts)
+                                .await?
+                            {
                                 self.conflict_resolver.verify_conflicts_resolved().await?;
-                                print_success("Automatically resolved conflicts and completed operation");
+                                print_success(
+                                    "Automatically resolved conflicts and completed operation",
+                                );
                                 Ok(())
                             } else {
                                 print_warning("Automatic resolution failed. Please resolve manually or abort.");
                                 Err(TrainError::InvalidState {
                                     message: "Automatic conflict resolution failed".to_string(),
-                                }.into())
+                                }
+                                .into())
                             }
                         }
                         1 => {
-                            self.conflict_resolver.resolve_conflicts_interactively(&conflicts).await
+                            self.conflict_resolver
+                                .resolve_conflicts_interactively(&conflicts)
+                                .await
                         }
                         2 => {
                             self.conflict_resolver.abort_current_operation()?;
@@ -1009,7 +1181,8 @@ impl StackManager {
                             print_info("Resolution deferred. Use 'git-train resolve interactive' when ready.");
                             Err(TrainError::InvalidState {
                                 message: "Manual conflict resolution deferred".to_string(),
-                            }.into())
+                            }
+                            .into())
                         }
                         _ => unreachable!(),
                     }
@@ -1017,17 +1190,19 @@ impl StackManager {
                     // No conflicts detected - this could be stale state files
                     print_info("No conflicts detected. This might be stale git state files.");
                     print_info("Attempting to clean up stale state and continue...");
-                    
+
                     // The get_git_state() call should have already cleaned up stale files,
                     // so let's check the state again after cleanup
                     let new_git_state = self.conflict_resolver.get_git_state()?;
-                    
+
                     if matches!(new_git_state, GitState::Clean) {
                         print_success("Successfully cleaned up stale git state files. Repository is now clean.");
                         Ok(())
                     } else {
                         // Still in problematic state, try to continue the operation
-                        print_info("Repository still shows active operation. Attempting to continue...");
+                        print_info(
+                            "Repository still shows active operation. Attempting to continue...",
+                        );
                         match git_state {
                             GitState::Rebasing => {
                                 match run_git_command(&["rebase", "--continue"]) {
@@ -1036,39 +1211,45 @@ impl StackManager {
                                         Ok(())
                                     }
                                     Err(_) => {
-                                        print_warning("Could not continue rebase. Offering to abort...");
+                                        print_warning(
+                                            "Could not continue rebase. Offering to abort...",
+                                        );
                                         if confirm_action("Abort the rebase?")? {
                                             run_git_command(&["rebase", "--abort"])?;
-                                            print_success("Rebase aborted. Repository is now clean.");
+                                            print_success(
+                                                "Rebase aborted. Repository is now clean.",
+                                            );
                                             Ok(())
                                         } else {
                                             Err(TrainError::InvalidState {
-                                                message: "Could not continue interrupted rebase".to_string(),
-                                            }.into())
+                                                message: "Could not continue interrupted rebase"
+                                                    .to_string(),
+                                            }
+                                            .into())
                                         }
                                     }
                                 }
                             }
-                            GitState::Merging => {
-                                match run_git_command(&["commit", "--no-edit"]) {
-                                    Ok(_) => {
-                                        print_success("Successfully completed merge");
+                            GitState::Merging => match run_git_command(&["commit", "--no-edit"]) {
+                                Ok(_) => {
+                                    print_success("Successfully completed merge");
+                                    Ok(())
+                                }
+                                Err(_) => {
+                                    print_warning("Could not complete merge. Offering to abort...");
+                                    if confirm_action("Abort the merge?")? {
+                                        run_git_command(&["merge", "--abort"])?;
+                                        print_success("Merge aborted. Repository is now clean.");
                                         Ok(())
-                                    }
-                                    Err(_) => {
-                                        print_warning("Could not complete merge. Offering to abort...");
-                                        if confirm_action("Abort the merge?")? {
-                                            run_git_command(&["merge", "--abort"])?;
-                                            print_success("Merge aborted. Repository is now clean.");
-                                            Ok(())
-                                        } else {
-                                            Err(TrainError::InvalidState {
-                                                message: "Could not complete interrupted merge".to_string(),
-                                            }.into())
+                                    } else {
+                                        Err(TrainError::InvalidState {
+                                            message: "Could not complete interrupted merge"
+                                                .to_string(),
                                         }
+                                        .into())
                                     }
                                 }
-                            }
+                            },
                             GitState::CherryPicking => {
                                 match run_git_command(&["cherry-pick", "--continue"]) {
                                     Ok(_) => {
@@ -1076,15 +1257,22 @@ impl StackManager {
                                         Ok(())
                                     }
                                     Err(_) => {
-                                        print_warning("Could not continue cherry-pick. Offering to abort...");
+                                        print_warning(
+                                            "Could not continue cherry-pick. Offering to abort...",
+                                        );
                                         if confirm_action("Abort the cherry-pick?")? {
                                             run_git_command(&["cherry-pick", "--abort"])?;
-                                            print_success("Cherry-pick aborted. Repository is now clean.");
+                                            print_success(
+                                                "Cherry-pick aborted. Repository is now clean.",
+                                            );
                                             Ok(())
                                         } else {
                                             Err(TrainError::InvalidState {
-                                                message: "Could not continue interrupted cherry-pick".to_string(),
-                                            }.into())
+                                                message:
+                                                    "Could not continue interrupted cherry-pick"
+                                                        .to_string(),
+                                            }
+                                            .into())
                                         }
                                     }
                                 }
@@ -1097,11 +1285,15 @@ impl StackManager {
             GitState::Conflicted => {
                 print_warning("Repository has unresolved conflicts.");
                 if let Some(conflicts) = self.conflict_resolver.detect_conflicts()? {
-                    self.conflict_resolver.resolve_conflicts_interactively(&conflicts).await
+                    self.conflict_resolver
+                        .resolve_conflicts_interactively(&conflicts)
+                        .await
                 } else {
                     Err(TrainError::InvalidState {
-                        message: "Repository appears to have conflicts but none were detected".to_string(),
-                    }.into())
+                        message: "Repository appears to have conflicts but none were detected"
+                            .to_string(),
+                    }
+                    .into())
                 }
             }
         }
@@ -1133,8 +1325,11 @@ impl StackManager {
         // Rebase all stack branches with better error handling
         let mut updated_stack = stack.clone();
         let hierarchy = self.build_branch_hierarchy(&stack);
-        
-        match self.rebase_branch_hierarchy(&mut updated_stack, &hierarchy, &stack.base_branch).await {
+
+        match self
+            .rebase_branch_hierarchy(&mut updated_stack, &hierarchy, &stack.base_branch)
+            .await
+        {
             Ok(_) => {
                 print_success("Successfully rebased all branches");
             }
@@ -1143,12 +1338,12 @@ impl StackManager {
                 print_info("You can:");
                 print_info("• Run 'git-train resolve interactive' to handle conflicts");
                 print_info("• Run 'git-train sync' again after resolving issues");
-                
+
                 // Try to return to a safe state
-                if let Err(_) = run_git_command(&["checkout", &current_branch]) {
+                if run_git_command(&["checkout", &current_branch]).is_err() {
                     print_warning(&format!("Could not return to original branch '{}'. You may need to checkout manually.", current_branch));
                 }
-                
+
                 return Err(e);
             }
         }
@@ -1156,7 +1351,11 @@ impl StackManager {
         // Update merge request targets if GitLab client is available
         if self.gitlab_client.is_some() {
             print_info("Updating merge request targets after sync...");
-            self.process_branches_with_mrs_for_updates(&mut updated_stack, "Updated MR targets for").await;
+            self.process_branches_with_mrs_for_updates(
+                &mut updated_stack,
+                "Updated MR targets for",
+            )
+            .await;
         }
 
         // Switch back to the original branch
@@ -1187,8 +1386,11 @@ impl StackManager {
     fn ensure_clean_working_directory(&self) -> Result<()> {
         if self.has_uncommitted_changes()? {
             return Err(TrainError::StackError {
-                message: "Working directory is not clean. Please commit or stash your changes first.".to_string(),
-            }.into());
+                message:
+                    "Working directory is not clean. Please commit or stash your changes first."
+                        .to_string(),
+            }
+            .into());
         }
         Ok(())
     }
@@ -1206,26 +1408,35 @@ impl StackManager {
     }
 
     /// Collects MR status information for all branches in the stack
-    async fn collect_mr_status_info(&self, stack: &Stack) -> std::collections::HashMap<String, MrStatusInfo> {
+    async fn collect_mr_status_info(
+        &self,
+        stack: &Stack,
+    ) -> std::collections::HashMap<String, MrStatusInfo> {
         let mut branch_mr_status = std::collections::HashMap::new();
-        
+
         if let Some(gitlab_client) = &self.gitlab_client {
             for (branch_name, branch) in &stack.branches {
                 if let Some(mr_iid) = branch.mr_iid {
                     // Fetch current MR status from GitLab
                     match gitlab_client.get_merge_request(mr_iid).await {
                         Ok(mr) => {
-                            branch_mr_status.insert(branch_name.clone(), MrStatusInfo {
-                                iid: mr_iid,
-                                state: mr.state,
-                            });
+                            branch_mr_status.insert(
+                                branch_name.clone(),
+                                MrStatusInfo {
+                                    iid: mr_iid,
+                                    state: mr.state,
+                                },
+                            );
                         }
                         Err(_) => {
                             // If we can't fetch MR status, show as unknown
-                            branch_mr_status.insert(branch_name.clone(), MrStatusInfo {
-                                iid: mr_iid,
-                                state: "unknown".to_string(),
-                            });
+                            branch_mr_status.insert(
+                                branch_name.clone(),
+                                MrStatusInfo {
+                                    iid: mr_iid,
+                                    state: "unknown".to_string(),
+                                },
+                            );
                         }
                     }
                 }
@@ -1234,39 +1445,71 @@ impl StackManager {
             // No GitLab client, just use the stored MR IIDs without status
             for (branch_name, branch) in &stack.branches {
                 if let Some(mr_iid) = branch.mr_iid {
-                    branch_mr_status.insert(branch_name.clone(), MrStatusInfo {
-                        iid: mr_iid,
-                        state: "unknown".to_string(),
-                    });
+                    branch_mr_status.insert(
+                        branch_name.clone(),
+                        MrStatusInfo {
+                            iid: mr_iid,
+                            state: "unknown".to_string(),
+                        },
+                    );
                 }
             }
         }
-        
+
         branch_mr_status
     }
 
     /// Process all branches in the stack for MR creation/updates
     async fn process_all_branches_for_mrs(&self, stack: &mut Stack, success_message_prefix: &str) {
         if let Some(gitlab_client) = &self.gitlab_client {
-            let branches_to_process: Vec<(String, StackBranch)> = stack.branches.clone().into_iter().collect();
+            let branches_to_process: Vec<(String, StackBranch)> =
+                stack.branches.clone().into_iter().collect();
             for (branch_name, branch) in branches_to_process {
-                match self.create_or_update_mr_with_smart_targeting_and_store(gitlab_client, &branch_name, &branch, stack).await {
+                match self
+                    .create_or_update_mr_with_smart_targeting_and_store(
+                        gitlab_client,
+                        &branch_name,
+                        &branch,
+                        stack,
+                    )
+                    .await
+                {
                     Ok(_) => print_success(&format!("{} {}", success_message_prefix, branch_name)),
-                    Err(e) => print_warning(&format!("Failed to update MR for {}: {}", branch_name, e)),
+                    Err(e) => {
+                        print_warning(&format!("Failed to update MR for {}: {}", branch_name, e))
+                    }
                 }
             }
         }
     }
 
     /// Process only branches that already have MRs for updates
-    async fn process_branches_with_mrs_for_updates(&self, stack: &mut Stack, success_message_prefix: &str) {
+    async fn process_branches_with_mrs_for_updates(
+        &self,
+        stack: &mut Stack,
+        success_message_prefix: &str,
+    ) {
         if let Some(gitlab_client) = &self.gitlab_client {
-            let branches_to_process: Vec<(String, StackBranch)> = stack.branches.clone().into_iter().collect();
+            let branches_to_process: Vec<(String, StackBranch)> =
+                stack.branches.clone().into_iter().collect();
             for (branch_name, branch) in branches_to_process {
                 if branch.mr_iid.is_some() {
-                    match self.create_or_update_mr_with_smart_targeting_and_store(gitlab_client, &branch_name, &branch, stack).await {
-                        Ok(_) => print_success(&format!("{} {}", success_message_prefix, branch_name)),
-                        Err(e) => print_warning(&format!("Failed to update MR for {}: {}", branch_name, e)),
+                    match self
+                        .create_or_update_mr_with_smart_targeting_and_store(
+                            gitlab_client,
+                            &branch_name,
+                            &branch,
+                            stack,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            print_success(&format!("{} {}", success_message_prefix, branch_name))
+                        }
+                        Err(e) => print_warning(&format!(
+                            "Failed to update MR for {}: {}",
+                            branch_name, e
+                        )),
                     }
                 }
             }
@@ -1299,71 +1542,94 @@ impl StackManager {
 
         Err(TrainError::StackError {
             message: format!("Stack '{}' not found", stack_identifier),
-        }.into())
-    }
-
-    /// Format MR info for display in hierarchy
-    fn format_mr_info_for_display(&self, mr_iid: Option<u64>) -> String {
-        if let Some(iid) = mr_iid {
-            format!(" [MR !{}]", iid)
-        } else {
-            String::new()
         }
+        .into())
     }
 
-    /// Format MR info with status for enhanced display
-    fn format_mr_info_with_status(&self, branch_name: &str, branch_mr_status: &std::collections::HashMap<String, MrStatusInfo>) -> String {
-        if let Some(mr_status) = branch_mr_status.get(branch_name) {
-            let (status_icon, status_text) = match mr_status.state.as_str() {
-                "merged" => ("✅", "MERGED".to_string()),
-                "closed" => ("❌", "CLOSED".to_string()),
-                "opened" => ("🔄", "OPEN".to_string()),
-                _ => ("❓", mr_status.state.to_uppercase()),
-            };
-            format!(" [MR !{} {} {}]", mr_status.iid, status_icon, status_text)
-        } else {
-            String::new()
-        }
-    }
-
-    fn print_branch_hierarchy_with_status(&self, hierarchy: &HashMap<String, Vec<String>>, stack: &Stack, branch_mr_status: &std::collections::HashMap<String, MrStatusInfo>, indent: usize) {
+    fn print_branch_hierarchy_with_status(
+        &self,
+        hierarchy: &HashMap<String, Vec<String>>,
+        stack: &Stack,
+        branch_mr_status: &std::collections::HashMap<String, MrStatusInfo>,
+        indent: usize,
+    ) {
         let indent_str = "  ".repeat(indent);
-        
+
         for (branch_name, branch) in &stack.branches {
-            if branch.parent.is_none() || (indent == 0 && branch.parent.as_ref() == Some(&stack.base_branch)) {
-                let status = if Some(branch_name) == stack.current_branch.as_ref() { " (current)" } else { "" };
-                let mr_info = self.format_mr_info_with_status(branch_name, branch_mr_status);
-                
+            if branch.parent.is_none()
+                || (indent == 0 && branch.parent.as_ref() == Some(&stack.base_branch))
+            {
+                let status = if Some(branch_name) == stack.current_branch.as_ref() {
+                    " (current)"
+                } else {
+                    ""
+                };
+                let mr_info = format_mr_info_with_status(branch_name, branch_mr_status);
+
                 println!("{}📋 {}{}{}", indent_str, branch_name, status, mr_info);
                 println!("{}   └─ {}", indent_str, &branch.commit_hash[..8]);
-                
+
                 if let Some(children) = hierarchy.get(branch_name) {
                     for child in children {
-                        self.print_branch_details_with_status(child, stack, branch_mr_status, indent + 1);
-                        self.print_children_recursive_with_status(hierarchy, stack, branch_mr_status, child, indent + 1);
+                        self.print_branch_details_with_status(
+                            child,
+                            stack,
+                            branch_mr_status,
+                            indent + 1,
+                        );
+                        self.print_children_recursive_with_status(
+                            hierarchy,
+                            stack,
+                            branch_mr_status,
+                            child,
+                            indent + 1,
+                        );
                     }
                 }
             }
         }
     }
 
-    fn print_branch_details_with_status(&self, branch_name: &str, stack: &Stack, branch_mr_status: &std::collections::HashMap<String, MrStatusInfo>, indent: usize) {
+    fn print_branch_details_with_status(
+        &self,
+        branch_name: &str,
+        stack: &Stack,
+        branch_mr_status: &std::collections::HashMap<String, MrStatusInfo>,
+        indent: usize,
+    ) {
         let indent_str = "  ".repeat(indent);
-        
+
         if let Some(branch) = stack.branches.get(branch_name) {
-            let status = if Some(branch_name) == stack.current_branch.as_deref() { " (current)" } else { "" };
-            let mr_info = self.format_mr_info_with_status(branch_name, branch_mr_status);
-            
+            let status = if Some(branch_name) == stack.current_branch.as_deref() {
+                " (current)"
+            } else {
+                ""
+            };
+            let mr_info = format_mr_info_with_status(branch_name, branch_mr_status);
+
             println!("{}├─ {}{}{}", indent_str, branch_name, status, mr_info);
             println!("{}│  └─ {}", indent_str, &branch.commit_hash[..8]);
         }
     }
 
-    fn print_children_recursive_with_status(&self, hierarchy: &HashMap<String, Vec<String>>, stack: &Stack, branch_mr_status: &std::collections::HashMap<String, MrStatusInfo>, branch_name: &str, indent: usize) {
+    fn print_children_recursive_with_status(
+        &self,
+        hierarchy: &HashMap<String, Vec<String>>,
+        stack: &Stack,
+        branch_mr_status: &std::collections::HashMap<String, MrStatusInfo>,
+        branch_name: &str,
+        indent: usize,
+    ) {
         if let Some(children) = hierarchy.get(branch_name) {
             for child in children {
                 self.print_branch_details_with_status(child, stack, branch_mr_status, indent + 1);
-                self.print_children_recursive_with_status(hierarchy, stack, branch_mr_status, child, indent + 1);
+                self.print_children_recursive_with_status(
+                    hierarchy,
+                    stack,
+                    branch_mr_status,
+                    child,
+                    indent + 1,
+                );
             }
         }
     }
@@ -1371,9 +1637,9 @@ impl StackManager {
     fn determine_base_branch(&self, current_branch: &str) -> Result<String> {
         // Try to determine the base branch by checking common base branches
         let potential_bases = ["main", "master", "develop", "dev"];
-        
+
         for base in &potential_bases {
-            if let Ok(_) = run_git_command(&["merge-base", current_branch, base]) {
+            if run_git_command(&["merge-base", current_branch, base]).is_ok() {
                 return Ok(base.to_string());
             }
         }
@@ -1385,21 +1651,21 @@ impl StackManager {
 
     async fn propagate_changes(&self, stack: &mut Stack, changed_branch: &str) -> Result<()> {
         let hierarchy = self.build_branch_hierarchy(stack);
-        
+
         if let Some(children) = hierarchy.get(changed_branch) {
             for child_branch in children {
                 print_info(&format!("Propagating changes to: {}", child_branch));
-                
+
                 // Checkout the child branch
                 run_git_command(&["checkout", child_branch])?;
-                
+
                 // Attempt smart rebase with conflict resolution
                 if let Err(e) = self.smart_rebase(child_branch, changed_branch).await {
                     print_error(&format!("Failed to rebase {}: {}", child_branch, e));
                     // Continue with other branches
                     continue;
                 }
-                
+
                 // Update stack state on successful rebase
                 let new_commit = self.get_current_commit_hash()?;
                 if let Some(branch) = stack.branches.get_mut(child_branch) {
@@ -1407,7 +1673,7 @@ impl StackManager {
                     branch.updated_at = Utc::now();
                 }
                 print_success(&format!("Rebased {} onto {}", child_branch, changed_branch));
-                
+
                 // Recursively propagate to grandchildren
                 Box::pin(self.propagate_changes(stack, child_branch)).await?;
             }
@@ -1418,11 +1684,12 @@ impl StackManager {
 
     fn build_branch_hierarchy(&self, stack: &Stack) -> HashMap<String, Vec<String>> {
         let mut hierarchy: HashMap<String, Vec<String>> = HashMap::new();
-        
+
         for (branch_name, branch) in &stack.branches {
             if let Some(parent) = &branch.parent {
-                hierarchy.entry(parent.clone())
-                    .or_insert_with(Vec::new)
+                hierarchy
+                    .entry(parent.clone())
+                    .or_default()
                     .push(branch_name.clone());
             }
         }
@@ -1430,58 +1697,21 @@ impl StackManager {
         hierarchy
     }
 
-    fn print_branch_hierarchy(&self, hierarchy: &HashMap<String, Vec<String>>, stack: &Stack, indent: usize) {
-        let indent_str = "  ".repeat(indent);
-        
-        for (branch_name, branch) in &stack.branches {
-            if branch.parent.is_none() || (indent == 0 && branch.parent.as_ref() == Some(&stack.base_branch)) {
-                let status = if Some(branch_name) == stack.current_branch.as_ref() { " (current)" } else { "" };
-                let mr_info = self.format_mr_info_for_display(branch.mr_iid);
-                
-                println!("{}📋 {}{}{}", indent_str, branch_name, status, mr_info);
-                println!("{}   └─ {}", indent_str, &branch.commit_hash[..8]);
-                
-                if let Some(children) = hierarchy.get(branch_name) {
-                    for child in children {
-                        self.print_branch_details(child, stack, indent + 1);
-                        self.print_children_recursive(hierarchy, stack, child, indent + 1);
-                    }
-                }
-            }
-        }
-    }
-
-    fn print_branch_details(&self, branch_name: &str, stack: &Stack, indent: usize) {
-        let indent_str = "  ".repeat(indent);
-        
-        if let Some(branch) = stack.branches.get(branch_name) {
-            let status = if Some(branch_name) == stack.current_branch.as_deref() { " (current)" } else { "" };
-            let mr_info = self.format_mr_info_for_display(branch.mr_iid);
-            
-            println!("{}├─ {}{}{}", indent_str, branch_name, status, mr_info);
-            println!("{}│  └─ {}", indent_str, &branch.commit_hash[..8]);
-        }
-    }
-
-    fn print_children_recursive(&self, hierarchy: &HashMap<String, Vec<String>>, stack: &Stack, branch_name: &str, indent: usize) {
-        if let Some(children) = hierarchy.get(branch_name) {
-            for child in children {
-                self.print_branch_details(child, stack, indent + 1);
-                self.print_children_recursive(hierarchy, stack, child, indent + 1);
-            }
-        }
-    }
-
-    async fn rebase_branch_hierarchy(&self, stack: &mut Stack, hierarchy: &HashMap<String, Vec<String>>, base_branch: &str) -> Result<()> {
+    async fn rebase_branch_hierarchy(
+        &self,
+        stack: &mut Stack,
+        hierarchy: &HashMap<String, Vec<String>>,
+        base_branch: &str,
+    ) -> Result<()> {
         let mut failed_branches = Vec::new();
-        
+
         // Rebase branches in order of dependency
         if let Some(children) = hierarchy.get(base_branch) {
             for child in children {
                 print_info(&format!("Rebasing {} onto {}", child, base_branch));
-                
+
                 run_git_command(&["checkout", child])?;
-                
+
                 // Use smart rebase with conflict resolution
                 match self.smart_rebase(child, base_branch).await {
                     Ok(_) => {
@@ -1492,9 +1722,11 @@ impl StackManager {
                             branch.updated_at = Utc::now();
                         }
                         print_success(&format!("Rebased {}", child));
-                        
+
                         // Recursively rebase children
-                        if let Err(e) = Box::pin(self.rebase_branch_hierarchy(stack, hierarchy, child)).await {
+                        if let Err(e) =
+                            Box::pin(self.rebase_branch_hierarchy(stack, hierarchy, child)).await
+                        {
                             print_error(&format!("Failed to rebase children of {}: {}", child, e));
                             // Don't fail the entire operation, but track the error
                             failed_branches.push(format!("children of {}", child));
@@ -1503,20 +1735,25 @@ impl StackManager {
                     Err(e) => {
                         print_error(&format!("Failed to rebase {}: {}", child, e));
                         failed_branches.push(child.clone());
-                        
+
                         // Check if we're in a state that needs recovery
                         let git_state = self.conflict_resolver.get_git_state()?;
                         if !matches!(git_state, GitState::Clean) {
-                            print_warning(&format!("Git is in state {:?} after failed rebase of {}", git_state, child));
-                            print_info("Stopping hierarchy rebase. Resolve conflicts and run sync again.");
-                            
+                            print_warning(&format!(
+                                "Git is in state {:?} after failed rebase of {}",
+                                git_state, child
+                            ));
+                            print_info(
+                                "Stopping hierarchy rebase. Resolve conflicts and run sync again.",
+                            );
+
                             if !failed_branches.is_empty() {
                                 return Err(TrainError::GitError {
                                     message: format!("Rebase failed for branch '{}'. Repository needs attention.", child),
                                 }.into());
                             }
                         }
-                        
+
                         // Continue with other branches if git state is clean
                         continue;
                     }
@@ -1525,7 +1762,10 @@ impl StackManager {
         }
 
         if !failed_branches.is_empty() {
-            print_warning(&format!("The following branches failed to rebase: {}", failed_branches.join(", ")));
+            print_warning(&format!(
+                "The following branches failed to rebase: {}",
+                failed_branches.join(", ")
+            ));
             print_info("You may need to resolve conflicts manually for these branches.");
         }
 
@@ -1533,14 +1773,24 @@ impl StackManager {
     }
 
     /// Intelligently determine the optimal target branch for a given branch in the stack
-    async fn determine_optimal_target_branch(&self, branch_name: &str, stack: &Stack, gitlab_client: &GitLabClient) -> Result<String> {
-        let branch = stack.branches.get(branch_name).ok_or_else(|| {
-            TrainError::StackError {
+    async fn determine_optimal_target_branch(
+        &self,
+        branch_name: &str,
+        stack: &Stack,
+        gitlab_client: &GitLabClient,
+    ) -> Result<String> {
+        let branch = stack
+            .branches
+            .get(branch_name)
+            .ok_or_else(|| TrainError::StackError {
                 message: format!("Branch '{}' not found in stack", branch_name),
-            }
-        })?;
+            })?;
 
-        let mut current_parent = branch.parent.as_deref().unwrap_or(&stack.base_branch).to_string();
+        let mut current_parent = branch
+            .parent
+            .as_deref()
+            .unwrap_or(&stack.base_branch)
+            .to_string();
 
         // Walk up the stack hierarchy to find the best available target
         loop {
@@ -1557,14 +1807,23 @@ impl StackManager {
                         Ok(parent_mr) => {
                             if parent_mr.state == "merged" {
                                 // Parent is merged, target its target branch
-                                print_info(&format!("Parent branch '{}' is merged, retargeting to '{}'", 
-                                    current_parent, parent_mr.target_branch));
+                                print_info(&format!(
+                                    "Parent branch '{}' is merged, retargeting to '{}'",
+                                    current_parent, parent_mr.target_branch
+                                ));
                                 current_parent = parent_mr.target_branch;
                                 continue;
                             } else if parent_mr.state == "closed" {
                                 // Parent MR is closed, move up the hierarchy
-                                print_info(&format!("Parent branch '{}' MR is closed, moving up hierarchy", current_parent));
-                                current_parent = parent_branch.parent.as_deref().unwrap_or(&stack.base_branch).to_string();
+                                print_info(&format!(
+                                    "Parent branch '{}' MR is closed, moving up hierarchy",
+                                    current_parent
+                                ));
+                                current_parent = parent_branch
+                                    .parent
+                                    .as_deref()
+                                    .unwrap_or(&stack.base_branch)
+                                    .to_string();
                                 continue;
                             }
                             // Parent MR is open, this is a valid target
@@ -1572,18 +1831,32 @@ impl StackManager {
                         }
                         Err(_) => {
                             // Can't get MR status, assume branch is still valid
-                            print_warning(&format!("Unable to check MR status for parent '{}', assuming valid", current_parent));
+                            print_warning(&format!(
+                                "Unable to check MR status for parent '{}', assuming valid",
+                                current_parent
+                            ));
                             break;
                         }
                     }
                 } else {
                     // Parent branch exists but has no MR, check if the branch itself still exists
-                    match run_git_command(&["rev-parse", "--verify", &format!("origin/{}", current_parent)]) {
+                    match run_git_command(&[
+                        "rev-parse",
+                        "--verify",
+                        &format!("origin/{}", current_parent),
+                    ]) {
                         Ok(_) => break, // Branch exists remotely
                         Err(_) => {
                             // Branch doesn't exist remotely, move up the hierarchy
-                            print_info(&format!("Parent branch '{}' not found remotely, moving up hierarchy", current_parent));
-                            current_parent = parent_branch.parent.as_deref().unwrap_or(&stack.base_branch).to_string();
+                            print_info(&format!(
+                                "Parent branch '{}' not found remotely, moving up hierarchy",
+                                current_parent
+                            ));
+                            current_parent = parent_branch
+                                .parent
+                                .as_deref()
+                                .unwrap_or(&stack.base_branch)
+                                .to_string();
                             continue;
                         }
                     }
@@ -1598,11 +1871,19 @@ impl StackManager {
     }
 
     /// Create or update merge request with intelligent target branch selection and store MR IID
-    async fn create_or_update_mr_with_smart_targeting_and_store(&self, gitlab_client: &GitLabClient, branch_name: &str, branch: &StackBranch, stack: &mut Stack) -> Result<()> {
+    async fn create_or_update_mr_with_smart_targeting_and_store(
+        &self,
+        gitlab_client: &GitLabClient,
+        branch_name: &str,
+        branch: &StackBranch,
+        stack: &mut Stack,
+    ) -> Result<()> {
         // Determine the optimal target branch
-        let optimal_target = self.determine_optimal_target_branch(branch_name, stack, gitlab_client).await?;
+        let optimal_target = self
+            .determine_optimal_target_branch(branch_name, stack, gitlab_client)
+            .await?;
         let original_parent = branch.parent.as_deref().unwrap_or(&stack.base_branch);
-        
+
         let title = format!("[Stack: {}] {}", stack.name, branch_name);
         let description = Some(format!(
             "Part of stack: {}\n\nBase branch: {}\nOriginal parent: {}\nCurrent target: {}\n\nStack ID: {}",
@@ -1620,7 +1901,10 @@ impl StackManager {
 
             match gitlab_client.create_merge_request(request).await {
                 Ok(mr) => {
-                    print_success(&format!("Created MR !{} for branch {} targeting {}", mr.iid, branch_name, optimal_target));
+                    print_success(&format!(
+                        "Created MR !{} for branch {} targeting {}",
+                        mr.iid, branch_name, optimal_target
+                    ));
                     // Update the stack to store the MR IID
                     if let Some(stack_branch) = stack.branches.get_mut(branch_name) {
                         stack_branch.mr_iid = Some(mr.iid);
@@ -1635,18 +1919,31 @@ impl StackManager {
         } else {
             // Update existing MR, potentially changing the target
             let iid = branch.mr_iid.unwrap();
-            
+
             // First check current MR state to see if target needs updating
             let current_mr = gitlab_client.get_merge_request(iid).await?;
             let needs_retarget = current_mr.target_branch != optimal_target;
-            
+
             if needs_retarget {
-                print_info(&format!("Retargeting MR !{} for {} from '{}' to '{}'", 
-                    iid, branch_name, current_mr.target_branch, optimal_target));
-                
-                match gitlab_client.update_merge_request_with_target(iid, Some(title), description, Some(optimal_target.clone())).await {
+                print_info(&format!(
+                    "Retargeting MR !{} for {} from '{}' to '{}'",
+                    iid, branch_name, current_mr.target_branch, optimal_target
+                ));
+
+                match gitlab_client
+                    .update_merge_request_with_target(
+                        iid,
+                        Some(title),
+                        description,
+                        Some(optimal_target.clone()),
+                    )
+                    .await
+                {
                     Ok(_) => {
-                        print_success(&format!("Retargeted MR !{} for branch {} to {}", iid, branch_name, optimal_target));
+                        print_success(&format!(
+                            "Retargeted MR !{} for branch {} to {}",
+                            iid, branch_name, optimal_target
+                        ));
                         // Update the stack to reflect the change
                         if let Some(stack_branch) = stack.branches.get_mut(branch_name) {
                             stack_branch.updated_at = Utc::now();
@@ -1654,12 +1951,18 @@ impl StackManager {
                         stack.updated_at = Utc::now();
                     }
                     Err(e) => {
-                        print_warning(&format!("Failed to retarget MR !{} for {}: {}", iid, branch_name, e));
+                        print_warning(&format!(
+                            "Failed to retarget MR !{} for {}: {}",
+                            iid, branch_name, e
+                        ));
                     }
                 }
             } else {
                 // Just update title and description
-                match gitlab_client.update_merge_request(iid, Some(title), description).await {
+                match gitlab_client
+                    .update_merge_request(iid, Some(title), description)
+                    .await
+                {
                     Ok(_) => {
                         print_success(&format!("Updated MR !{} for branch {}", iid, branch_name));
                         // Update the stack to reflect the change
@@ -1669,7 +1972,10 @@ impl StackManager {
                         stack.updated_at = Utc::now();
                     }
                     Err(e) => {
-                        print_warning(&format!("Failed to update MR !{} for {}: {}", iid, branch_name, e));
+                        print_warning(&format!(
+                            "Failed to update MR !{} for {}: {}",
+                            iid, branch_name, e
+                        ));
                     }
                 }
             }
@@ -1681,13 +1987,13 @@ impl StackManager {
     fn save_stack_state(&self, stack: &Stack) -> Result<()> {
         let stack_file = self.train_dir.join(format!("{}.json", stack.id));
         let stack_json = serde_json::to_string_pretty(stack)?;
-        
+
         fs::write(&stack_file, stack_json)?;
-        
+
         // Also save a "current" symlink/file for easy access
         let current_file = self.train_dir.join("current.json");
         fs::write(&current_file, &stack.id)?;
-        
+
         info!("Saved stack state to: {:?}", stack_file);
         Ok(())
     }
@@ -1697,21 +2003,41 @@ impl StackManager {
         if !current_file.exists() {
             return Err(TrainError::StackError {
                 message: "No current stack found".to_string(),
-            }.into());
+            }
+            .into());
         }
 
         let stack_id = fs::read_to_string(&current_file)?;
         let stack_file = self.train_dir.join(format!("{}.json", stack_id.trim()));
-        
+
         if !stack_file.exists() {
             return Err(TrainError::StackError {
                 message: format!("Stack file not found: {:?}", stack_file),
-            }.into());
+            }
+            .into());
         }
 
         let stack_json = fs::read_to_string(&stack_file)?;
         let stack: Stack = serde_json::from_str(&stack_json)?;
-        
+
         Ok(stack)
     }
-} 
+}
+
+/// Format MR info with status for enhanced display
+fn format_mr_info_with_status(
+    branch_name: &str,
+    branch_mr_status: &std::collections::HashMap<String, MrStatusInfo>,
+) -> String {
+    if let Some(mr_status) = branch_mr_status.get(branch_name) {
+        let (status_icon, status_text) = match mr_status.state.as_str() {
+            "merged" => ("✅", "MERGED".to_string()),
+            "closed" => ("❌", "CLOSED".to_string()),
+            "opened" => ("🔄", "OPEN".to_string()),
+            _ => ("❓", mr_status.state.to_uppercase()),
+        };
+        format!(" [MR !{} {} {}]", mr_status.iid, status_icon, status_text)
+    } else {
+        String::new()
+    }
+}

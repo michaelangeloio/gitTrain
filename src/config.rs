@@ -2,12 +2,12 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::errors::TrainError;
-use crate::utils::{get_user_input, print_info, print_warning};
+use crate::utils::{get_user_input, print_info};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TrainConfig {
     pub editor: EditorConfig,
     pub conflict_resolution: ConflictResolutionConfig,
@@ -56,16 +56,6 @@ pub enum RebaseStrategy {
     Merge,
     /// Interactive rebase when conflicts occur
     Interactive,
-}
-
-impl Default for TrainConfig {
-    fn default() -> Self {
-        Self {
-            editor: EditorConfig::default(),
-            conflict_resolution: ConflictResolutionConfig::default(),
-            git: GitConfig::default(),
-        }
-    }
 }
 
 impl Default for EditorConfig {
@@ -145,7 +135,10 @@ impl ConfigManager {
             default_config
         };
 
-        Ok(Self { config_path, config })
+        Ok(Self {
+            config_path,
+            config,
+        })
     }
 
     pub fn get_config(&self) -> &TrainConfig {
@@ -164,7 +157,7 @@ impl ConfigManager {
     pub fn set_default_editor(&mut self, editor: &str) -> Result<()> {
         self.update_config(|config| {
             config.editor.default_editor = editor.to_string();
-            
+
             // Set appropriate args based on editor
             config.editor.editor_args = match editor {
                 "cursor" | "code" => vec!["--wait".to_string()],
@@ -174,7 +167,7 @@ impl ConfigManager {
                 _ => vec!["--wait".to_string()],
             };
         })?;
-        
+
         print_info(&format!("Set default editor to: {}", editor));
         Ok(())
     }
@@ -186,13 +179,17 @@ impl ConfigManager {
         let current_editor = &self.config.editor.default_editor;
         let editor_prompt = format!("Default editor (current: {})", current_editor);
         let editor = get_user_input(&editor_prompt, Some(current_editor))?;
-        
+
         if editor != *current_editor {
             self.set_default_editor(&editor)?;
         }
 
         // Configure conflict resolution strategy
-        let strategies = ["Never auto-resolve", "Simple auto-resolve", "Smart auto-resolve"];
+        let strategies = [
+            "Never auto-resolve",
+            "Simple auto-resolve",
+            "Smart auto-resolve",
+        ];
         let current_strategy_idx = match self.config.conflict_resolution.auto_resolve_strategy {
             AutoResolveStrategy::Never => 0,
             AutoResolveStrategy::Simple => 1,
@@ -201,22 +198,28 @@ impl ConfigManager {
 
         println!("Conflict resolution strategies:");
         for (i, strategy) in strategies.iter().enumerate() {
-            let marker = if i == current_strategy_idx { "→" } else { " " };
+            let marker = if i == current_strategy_idx {
+                "→"
+            } else {
+                " "
+            };
             println!("{} {}: {}", marker, i + 1, strategy);
         }
 
-        let strategy_input = get_user_input("Choose conflict resolution strategy (1-3)", 
-            Some(&(current_strategy_idx + 1).to_string()))?;
-        
+        let strategy_input = get_user_input(
+            "Choose conflict resolution strategy (1-3)",
+            Some(&(current_strategy_idx + 1).to_string()),
+        )?;
+
         if let Ok(choice) = strategy_input.parse::<usize>() {
-            if choice >= 1 && choice <= 3 {
+            if (1..=3).contains(&choice) {
                 let new_strategy = match choice {
                     1 => AutoResolveStrategy::Never,
                     2 => AutoResolveStrategy::Simple,
                     3 => AutoResolveStrategy::Smart,
                     _ => unreachable!(),
                 };
-                
+
                 self.update_config(|config| {
                     config.conflict_resolution.auto_resolve_strategy = new_strategy;
                 })?;
@@ -229,16 +232,16 @@ impl ConfigManager {
 
     fn load_config(path: &PathBuf) -> Result<TrainConfig> {
         let content = fs::read_to_string(path)?;
-        let config: TrainConfig = toml::from_str(&content)
-            .map_err(|e| TrainError::SerializationError {
+        let config: TrainConfig =
+            toml::from_str(&content).map_err(|e| TrainError::SerializationError {
                 message: format!("Failed to parse config: {}", e),
             })?;
         Ok(config)
     }
 
     fn save_config(path: &PathBuf, config: &TrainConfig) -> Result<()> {
-        let content = toml::to_string_pretty(config)
-            .map_err(|e| TrainError::SerializationError {
+        let content =
+            toml::to_string_pretty(config).map_err(|e| TrainError::SerializationError {
                 message: format!("Failed to serialize config: {}", e),
             })?;
         fs::write(path, content)?;
@@ -255,6 +258,12 @@ mod which {
             .arg(command)
             .output()
             .map_err(|_| ())
-            .and_then(|output| if output.status.success() { Ok(()) } else { Err(()) })
+            .and_then(|output| {
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            })
     }
-} 
+}

@@ -1,11 +1,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(
-    name = "git-train",
-    version,
-    about = "Simple stack diff CLI tool"
-)]
+#[command(name = "git-train", version, about = "Simple stack diff CLI tool")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -86,22 +82,22 @@ pub enum Commands {
 pub enum ConfigCommands {
     /// Show current configuration
     Show,
-    
+
     /// Configure git-train interactively
     Setup,
-    
+
     /// Set default editor
     SetEditor {
         /// Editor command (e.g., 'cursor', 'code', 'vim')
         editor: String,
     },
-    
+
     /// Set conflict resolution strategy
     SetStrategy {
         /// Strategy: 'never', 'simple', or 'smart'
         strategy: String,
     },
-    
+
     /// Set force-push behavior
     SetForcePush {
         /// Mode: 'auto', 'prompt', or 'never'
@@ -113,22 +109,22 @@ pub enum ConfigCommands {
 pub enum ResolveCommands {
     /// Check for conflicts in current repository
     Check,
-    
+
     /// Resolve conflicts interactively
     Interactive,
-    
+
     /// Attempt automatic conflict resolution
     Auto,
-    
+
     /// Abort current git operation
     Abort,
-    
+
     /// Continue after resolving conflicts manually
     Continue,
-    
+
     /// Attempt to recover from interrupted git operations
     Recover,
-    
+
     /// Force cleanup of all stale git state files
     Cleanup,
-} 
+}

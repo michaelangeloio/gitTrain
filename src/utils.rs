@@ -1,14 +1,12 @@
 use anyhow::Result;
 use console::{style, Term};
-use inquire::{Confirm, Select, Text, Editor};
+use inquire::{Confirm, Select, Text};
 use std::process::Command;
-use tracing::{info, warn, error};
+use tracing::{error, info};
 
 pub fn confirm_action(message: &str) -> Result<bool> {
-    let confirmation = Confirm::new(message)
-        .with_default(false)
-        .prompt()?;
-    
+    let confirmation = Confirm::new(message).with_default(false).prompt()?;
+
     Ok(confirmation)
 }
 
@@ -17,7 +15,7 @@ pub fn select_from_list<T: ToString + Clone>(items: &[T], prompt: &str) -> Resul
     let selection = Select::new(prompt, string_items)
         .with_page_size(15)
         .prompt()?;
-    
+
     // Find the index of the selected item
     let selected_string = selection;
     for (i, item) in items.iter().enumerate() {
@@ -25,33 +23,20 @@ pub fn select_from_list<T: ToString + Clone>(items: &[T], prompt: &str) -> Resul
             return Ok(i);
         }
     }
-    
+
     // This shouldn't happen, but fallback to 0
     Ok(0)
 }
 
-pub fn fuzzy_select_from_list<T: ToString + Clone>(items: &[T], prompt: &str) -> Result<usize> {
-    // The regular Select prompt already has fuzzy filtering enabled by default
-    select_from_list(items, prompt)
-}
-
 pub fn get_user_input(prompt: &str, default: Option<&str>) -> Result<String> {
     let mut input = Text::new(prompt);
-    
+
     if let Some(default_value) = default {
         input = input.with_default(default_value);
     }
-    
+
     let result = input.prompt()?;
     Ok(result)
-}
-
-pub fn open_editor(initial_content: Option<&str>) -> Result<String> {
-    let content = Editor::new("Enter your text:")
-        .with_predefined_text(initial_content.unwrap_or(""))
-        .prompt()?;
-    
-    Ok(content)
 }
 
 #[derive(Debug, Clone)]
@@ -83,15 +68,15 @@ pub struct MrStatusInfo {
 }
 
 pub fn create_navigation_options(
-    branches: &[String], 
+    branches: &[String],
     current_branch: Option<&str>,
-    branch_mr_status: &std::collections::HashMap<String, MrStatusInfo>
+    branch_mr_status: &std::collections::HashMap<String, MrStatusInfo>,
 ) -> Vec<NavigationOption> {
     let mut options = Vec::new();
-    
+
     // Add branch navigation options
     for branch in branches {
-        let is_current = current_branch.map_or(false, |current| current == branch);
+        let is_current = current_branch.is_some_and(|current| current == branch);
         let mr_info = if let Some(mr_status) = branch_mr_status.get(branch) {
             let (status_icon, status_text, priority_indicator) = match mr_status.state.as_str() {
                 "merged" => ("✅", "MERGED".to_string(), " 🎉"),
@@ -99,28 +84,31 @@ pub fn create_navigation_options(
                 "opened" => ("🔄", "OPEN".to_string(), " 🚀"),
                 _ => ("❓", mr_status.state.to_uppercase(), ""),
             };
-            format!(" [MR !{} {} {}{}]", mr_status.iid, status_icon, status_text, priority_indicator)
+            format!(
+                " [MR !{} {} {}{}]",
+                mr_status.iid, status_icon, status_text, priority_indicator
+            )
         } else {
             String::new()
         };
-        
+
         let display = if is_current {
             format!("🔸 {} (current){}", branch, mr_info)
         } else {
             format!("📋 {}{}", branch, mr_info)
         };
-        
+
         options.push(NavigationOption {
             display: display.clone(),
             action: NavigationAction::SwitchToBranch(branch.clone()),
         });
-        
+
         // Add additional actions for each branch
         options.push(NavigationOption {
             display: format!("  ℹ️  Show info for {}", branch),
             action: NavigationAction::ShowBranchInfo(branch.clone()),
         });
-        
+
         if let Some(mr_status) = branch_mr_status.get(branch) {
             options.push(NavigationOption {
                 display: format!("  🔗 View MR !{} for {}", mr_status.iid, branch),
@@ -133,30 +121,30 @@ pub fn create_navigation_options(
             });
         }
     }
-    
+
     // Add utility options
     options.push(NavigationOption {
         display: "🔄 Refresh status".to_string(),
         action: NavigationAction::RefreshStatus,
     });
-    
+
     options.push(NavigationOption {
         display: "❌ Exit navigation".to_string(),
         action: NavigationAction::Exit,
     });
-    
+
     options
 }
 
 pub fn interactive_stack_navigation(
     options: &[NavigationOption],
-    prompt: &str
+    prompt: &str,
 ) -> Result<NavigationAction> {
     let selection = Select::new(prompt, options.to_vec())
         .with_help_message("Use arrows to navigate, type to search, Enter to select")
         .with_page_size(15)
         .prompt()?;
-    
+
     // Return the action from the selected option
     Ok(selection.action.clone())
 }
@@ -181,10 +169,11 @@ pub fn print_train_header(title: &str) {
     let term = Term::stdout();
     let width = term.size().1 as usize;
     let border = "═".repeat(width.min(80));
-    
+
     println!("{}", style(&border).bold().cyan());
-    println!("{} 🚂 {} 🚂 {}", 
-        style("║").bold().cyan(), 
+    println!(
+        "{} 🚂 {} 🚂 {}",
+        style("║").bold().cyan(),
         style(title).bold().white(),
         style("║").bold().cyan()
     );
@@ -203,31 +192,11 @@ pub fn sanitize_branch_name(name: &str) -> String {
         .to_lowercase()
 }
 
-pub fn is_valid_git_ref(name: &str) -> bool {
-    // Basic Git ref validation
-    !name.is_empty() &&
-    !name.starts_with('/') &&
-    !name.ends_with('/') &&
-    !name.contains("..") &&
-    !name.contains(' ') &&
-    !name.contains('\t') &&
-    !name.contains('\n') &&
-    !name.contains('\r') &&
-    !name.contains('~') &&
-    !name.contains('^') &&
-    !name.contains(':') &&
-    !name.contains('?') &&
-    !name.contains('*') &&
-    !name.contains('[')
-}
-
 pub fn run_git_command(args: &[&str]) -> Result<String> {
     info!("Running git command: git {}", args.join(" "));
-    
-    let output = Command::new("git")
-        .args(args)
-        .output()?;
-    
+
+    let output = Command::new("git").args(args).output()?;
+
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         Ok(stdout.trim().to_string())
@@ -256,15 +225,4 @@ mod tests {
         assert_eq!(sanitize_branch_name("fix/bug#123"), "fix_bug_123");
         assert_eq!(sanitize_branch_name("--start--"), "start");
     }
-
-    #[test]
-    fn test_is_valid_git_ref() {
-        assert!(is_valid_git_ref("feature-branch"));
-        assert!(is_valid_git_ref("fix_bug_123"));
-        assert!(!is_valid_git_ref(""));
-        assert!(!is_valid_git_ref("/invalid"));
-        assert!(!is_valid_git_ref("invalid/"));
-        assert!(!is_valid_git_ref("invalid..ref"));
-        assert!(!is_valid_git_ref("invalid ref"));
-    }
-} 
+}
