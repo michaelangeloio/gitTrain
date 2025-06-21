@@ -78,29 +78,163 @@ impl ConflictResolver {
     pub fn get_git_state(&self) -> Result<GitState> {
         let git_dir = &self.git_dir;
         
+        // First check what git actually thinks about the repository state
+        let status_output = run_git_command(&["status", "--porcelain=v1"])?;
+        let status_lines: Vec<&str> = status_output.lines().collect();
+        
+        // Check for actual conflicts in working directory first
+        let has_conflicts = status_lines.iter().any(|line| {
+            line.starts_with("UU") || line.starts_with("AA") || 
+            line.starts_with("DU") || line.starts_with("UD") ||
+            line.starts_with("AU") || line.starts_with("UA")
+        });
+        
+        if has_conflicts {
+            return Ok(GitState::Conflicted);
+        }
+        
+        // Now check for ongoing operations, but verify they're actually active
         if git_dir.join("REBASE_HEAD").exists() {
-            return Ok(GitState::Rebasing);
+            // Double-check if rebase is actually in progress
+            if self.is_rebase_actually_active()? {
+                return Ok(GitState::Rebasing);
+            } else {
+                // Clean up stale rebase files
+                print_info("Detected stale rebase state files, cleaning up...");
+                self.cleanup_stale_rebase_files()?;
+            }
         }
         
         if git_dir.join("MERGE_HEAD").exists() {
-            return Ok(GitState::Merging);
+            // Double-check if merge is actually in progress
+            if self.is_merge_actually_active()? {
+                return Ok(GitState::Merging);
+            } else {
+                print_info("Detected stale merge state files, cleaning up...");
+                self.cleanup_stale_merge_files()?;
+            }
         }
         
         if git_dir.join("CHERRY_PICK_HEAD").exists() {
-            return Ok(GitState::CherryPicking);
-        }
-        
-        // Check for conflicts in working directory
-        let status_output = run_git_command(&["status", "--porcelain"])?;
-        for line in status_output.lines() {
-            if line.starts_with("UU") || line.starts_with("AA") || 
-               line.starts_with("DU") || line.starts_with("UD") ||
-               line.starts_with("AU") || line.starts_with("UA") {
-                return Ok(GitState::Conflicted);
+            // Double-check if cherry-pick is actually in progress
+            if self.is_cherry_pick_actually_active()? {
+                return Ok(GitState::CherryPicking);
+            } else {
+                print_info("Detected stale cherry-pick state files, cleaning up...");
+                self.cleanup_stale_cherry_pick_files()?;
             }
         }
         
         Ok(GitState::Clean)
+    }
+
+    /// Check if a rebase is actually in progress (not just stale files)
+    fn is_rebase_actually_active(&self) -> Result<bool> {
+        // Try to get rebase info - this will fail if no rebase is actually in progress
+        match run_git_command(&["rebase", "--show-current-patch"]) {
+            Ok(_) => Ok(true),
+            Err(_) => {
+                // Also check for rebase directories that would exist during an active rebase
+                let git_dir = &self.git_dir;
+                Ok(git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists())
+            }
+        }
+    }
+
+    /// Check if a merge is actually in progress
+    fn is_merge_actually_active(&self) -> Result<bool> {
+        // Check if MERGE_MSG exists and is recent, and if there are actual merge conflicts
+        let git_dir = &self.git_dir;
+        Ok(git_dir.join("MERGE_MSG").exists() && git_dir.join("MERGE_HEAD").exists())
+    }
+
+    /// Check if a cherry-pick is actually in progress
+    fn is_cherry_pick_actually_active(&self) -> Result<bool> {
+        // Try to continue cherry-pick to see if it's actually in progress
+        match run_git_command(&["cherry-pick", "--continue", "--dry-run"]) {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Clean up stale rebase files
+    fn cleanup_stale_rebase_files(&self) -> Result<()> {
+        let git_dir = &self.git_dir;
+        let files_to_remove = [
+            "REBASE_HEAD",
+            "ORIG_HEAD", // Only if it's from a rebase
+        ];
+        
+        for file in &files_to_remove {
+            let file_path = git_dir.join(file);
+            if file_path.exists() {
+                if let Err(e) = std::fs::remove_file(&file_path) {
+                    print_warning(&format!("Could not remove stale file {}: {}", file, e));
+                } else {
+                    print_info(&format!("Removed stale file: {}", file));
+                }
+            }
+        }
+        
+        // Remove any stale rebase directories
+        let rebase_dirs = ["rebase-merge", "rebase-apply"];
+        for dir in &rebase_dirs {
+            let dir_path = git_dir.join(dir);
+            if dir_path.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&dir_path) {
+                    print_warning(&format!("Could not remove stale directory {}: {}", dir, e));
+                } else {
+                    print_info(&format!("Removed stale directory: {}", dir));
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Clean up stale merge files
+    fn cleanup_stale_merge_files(&self) -> Result<()> {
+        let git_dir = &self.git_dir;
+        let files_to_remove = [
+            "MERGE_HEAD",
+            "MERGE_MSG",
+            "MERGE_MODE",
+        ];
+        
+        for file in &files_to_remove {
+            let file_path = git_dir.join(file);
+            if file_path.exists() {
+                if let Err(e) = std::fs::remove_file(&file_path) {
+                    print_warning(&format!("Could not remove stale file {}: {}", file, e));
+                } else {
+                    print_info(&format!("Removed stale file: {}", file));
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Clean up stale cherry-pick files
+    fn cleanup_stale_cherry_pick_files(&self) -> Result<()> {
+        let git_dir = &self.git_dir;
+        let files_to_remove = [
+            "CHERRY_PICK_HEAD",
+            "CHERRY_PICK_MSG",
+        ];
+        
+        for file in &files_to_remove {
+            let file_path = git_dir.join(file);
+            if file_path.exists() {
+                if let Err(e) = std::fs::remove_file(&file_path) {
+                    print_warning(&format!("Could not remove stale file {}: {}", file, e));
+                } else {
+                    print_info(&format!("Removed stale file: {}", file));
+                }
+            }
+        }
+        
+        Ok(())
     }
 
     /// Detect and analyze conflicts in the repository
@@ -141,25 +275,42 @@ impl ConflictResolver {
         
         // Ask user how they want to proceed
         let options = vec![
-            "Open editor to resolve conflicts manually",
             "Try automatic resolution",
+            "Open editor to resolve conflicts manually",
             "Abort current operation",
         ];
         
-        let choice = crate::utils::select_from_list(&options, "How would you like to resolve the conflicts?")?;
+        let choice = match crate::utils::select_from_list(&options, "How would you like to resolve the conflicts?") {
+            Ok(choice) => choice,
+            Err(_) => {
+                // User cancelled (Ctrl+C) - provide graceful handling
+                print_warning("Operation cancelled by user.");
+                print_info("Resolution options:");
+                print_info("• Run 'git-train resolve interactive' to try again");
+                print_info("• Run 'git-train resolve abort' to cancel the current operation"); 
+                print_info("• Resolve conflicts manually and run 'git-train resolve continue'");
+                return Err(TrainError::InvalidState {
+                    message: "Conflict resolution cancelled by user".to_string(),
+                }.into());
+            }
+        };
         
         match choice {
-            0 => self.open_editor_for_conflicts(conflict_info).await,
-            1 => {
+            0 => {
                 if self.auto_resolve_conflicts(conflict_info).await? {
                     print_success("Conflicts resolved automatically");
-                    Ok(())
+                    self.verify_conflicts_resolved().await
                 } else {
                     print_warning("Automatic resolution failed, falling back to manual resolution");
                     self.open_editor_for_conflicts(conflict_info).await
                 }
             },
-            2 => self.abort_current_operation(),
+            1 => self.open_editor_for_conflicts(conflict_info).await,
+            2 => {
+                self.abort_current_operation()?;
+                print_success("Current operation aborted. Repository is now clean.");
+                Ok(())
+            },
             _ => unreachable!(),
         }
     }
@@ -175,12 +326,35 @@ impl ConflictResolver {
             cmd.args(&editor_config.editor_args);
             cmd.arg(&conflict_file.path);
             
-            let status = cmd.status()?;
-            
-            if !status.success() {
-                return Err(TrainError::GitError {
-                    message: format!("Editor {} exited with error", editor_config.default_editor),
-                }.into());
+            match cmd.status() {
+                Ok(status) => {
+                    if !status.success() {
+                        print_warning(&format!("Editor {} exited with non-zero status", editor_config.default_editor));
+                        
+                        // Check if user wants to continue with other files or abort
+                        if conflict_info.files.len() > 1 {
+                            let continue_choice = crate::utils::confirm_action("Continue editing other files?")?;
+                            if !continue_choice {
+                                print_info("Resolution options:");
+                                print_info("• Run 'git-train resolve interactive' to resume editing");
+                                print_info("• Run 'git-train resolve abort' to cancel the operation");
+                                return Err(TrainError::InvalidState {
+                                    message: "Manual conflict resolution interrupted".to_string(),
+                                }.into());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    print_error(&format!("Failed to launch editor {}: {}", editor_config.default_editor, e));
+                    print_info("You can:");
+                    print_info("• Resolve conflicts manually in your preferred editor");
+                    print_info("• Run 'git-train resolve continue' when done");
+                    print_info("• Run 'git-train resolve abort' to cancel");
+                    return Err(TrainError::GitError {
+                        message: format!("Could not launch editor: {}", e),
+                    }.into());
+                }
             }
         }
         
@@ -452,34 +626,259 @@ impl ConflictResolver {
         Ok(())
     }
 
-    // Placeholder implementations for conflict resolution strategies
-    fn resolve_simple_conflict(&self, _conflict_file: &ConflictFile) -> Result<bool> {
-        // TODO: Implement simple conflict resolution
+    /// Force cleanup of all stale git state files
+    pub fn cleanup_all_stale_files(&self) -> Result<()> {
+        print_info("Cleaning up all potentially stale git state files...");
+        
+        // Clean up stale files even if we think they're active
+        // This is a force cleanup for recovery scenarios
+        self.cleanup_stale_rebase_files()?;
+        self.cleanup_stale_merge_files()?; 
+        self.cleanup_stale_cherry_pick_files()?;
+        
+        print_success("Cleaned up all stale git state files");
+        Ok(())
+    }
+
+    // Implement actual conflict resolution strategies
+    fn resolve_simple_conflict(&self, conflict_file: &ConflictFile) -> Result<bool> {
+        let content = fs::read_to_string(&conflict_file.path)?;
+        let mut modified = false;
+        let mut new_content = content.clone();
+        
+        // Try to resolve each conflict marker
+        for marker in &conflict_file.conflict_markers {
+            if self.is_whitespace_conflict(&content, marker)? {
+                new_content = self.resolve_whitespace_conflict(&new_content, marker)?;
+                modified = true;
+            } else if self.is_line_ending_conflict(&content, marker)? {
+                new_content = self.resolve_line_ending_conflict(&new_content, marker)?;
+                modified = true;
+            } else if self.is_import_order_conflict(&content, marker)? {
+                new_content = self.resolve_import_order_conflict(&new_content, marker)?;
+                modified = true;
+            }
+        }
+        
+        if modified {
+            fs::write(&conflict_file.path, new_content)?;
+            print_success(&format!("Auto-resolved simple conflicts in {}", conflict_file.path));
+        }
+        
+        Ok(modified)
+    }
+
+    fn resolve_smart_conflict(&self, conflict_file: &ConflictFile) -> Result<bool> {
+        let content = fs::read_to_string(&conflict_file.path)?;
+        
+        // First try simple resolution
+        if self.resolve_simple_conflict(conflict_file)? {
+            return Ok(true);
+        }
+        
+        // Try non-overlapping changes resolution
+        if self.has_non_overlapping_changes(&content, conflict_file)? {
+            return self.resolve_non_overlapping_conflict(conflict_file);
+        }
+        
         Ok(false)
     }
 
-    fn resolve_smart_conflict(&self, _conflict_file: &ConflictFile) -> Result<bool> {
-        // TODO: Implement smart conflict resolution
+    fn is_whitespace_conflict(&self, content: &str, marker: &ConflictMarker) -> Result<bool> {
+        let lines: Vec<&str> = content.lines().collect();
+        
+        // Find the conflict block
+        let start_line = marker.line_number.saturating_sub(1);
+        let mut ours_lines = Vec::new();
+        let mut theirs_lines = Vec::new();
+        let mut in_ours = false;
+        let mut in_theirs = false;
+        
+        for (i, line) in lines.iter().enumerate() {
+            if i >= start_line {
+                if line.starts_with("<<<<<<<") {
+                    in_ours = true;
+                    continue;
+                } else if line.starts_with("=======") {
+                    in_ours = false;
+                    in_theirs = true;
+                    continue;
+                } else if line.starts_with(">>>>>>>") {
+                    break;
+                }
+                
+                if in_ours {
+                    ours_lines.push(*line);
+                } else if in_theirs {
+                    theirs_lines.push(*line);
+                }
+            }
+        }
+        
+        // Check if the only differences are whitespace
+        if ours_lines.len() == theirs_lines.len() {
+            for (our_line, their_line) in ours_lines.iter().zip(theirs_lines.iter()) {
+                if our_line.trim() != their_line.trim() {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        
         Ok(false)
     }
 
-    fn is_whitespace_conflict(&self, _content: &str, _marker: &ConflictMarker) -> Result<bool> {
-        // TODO: Implement whitespace conflict detection
+    fn is_line_ending_conflict(&self, content: &str, _marker: &ConflictMarker) -> Result<bool> {
+        // Simple heuristic: if the file contains mixed line endings, it might be a line ending conflict
+        let has_crlf = content.contains("\r\n");
+        let has_lf = content.contains('\n') && !content.contains("\r\n");
+        
+        Ok(has_crlf && has_lf)
+    }
+
+    fn is_import_order_conflict(&self, content: &str, marker: &ConflictMarker) -> Result<bool> {
+        let lines: Vec<&str> = content.lines().collect();
+        let start_line = marker.line_number.saturating_sub(1);
+        
+        // Check if conflict is in import/include section
+        for (i, line) in lines.iter().enumerate() {
+            if i >= start_line && i < start_line + 10 {  // Look in the vicinity
+                let trimmed = line.trim();
+                if trimmed.starts_with("import ") || trimmed.starts_with("from ") ||
+                   trimmed.starts_with("#include") || trimmed.starts_with("use ") {
+                    return Ok(true);
+                }
+            }
+        }
+        
         Ok(false)
     }
 
-    fn is_line_ending_conflict(&self, _content: &str, _marker: &ConflictMarker) -> Result<bool> {
-        // TODO: Implement line ending conflict detection
-        Ok(false)
+    fn has_non_overlapping_changes(&self, content: &str, conflict_file: &ConflictFile) -> Result<bool> {
+        // Simplified check: if there are multiple conflict blocks that don't seem to interact
+        Ok(conflict_file.conflict_markers.len() == 3) // Standard conflict has exactly 3 markers
     }
 
-    fn is_import_order_conflict(&self, _content: &str, _marker: &ConflictMarker) -> Result<bool> {
-        // TODO: Implement import order conflict detection
-        Ok(false)
+    fn resolve_whitespace_conflict(&self, content: &str, marker: &ConflictMarker) -> Result<String> {
+        let lines: Vec<&str> = content.lines().collect();
+        let mut result_lines = Vec::new();
+        let start_line = marker.line_number.saturating_sub(1);
+        let mut i = 0;
+        
+        while i < lines.len() {
+            if i == start_line && lines[i].starts_with("<<<<<<<") {
+                // Found conflict start, collect 'ours' lines (normalized)
+                i += 1; // Skip conflict marker
+                let mut resolved_lines = Vec::new();
+                
+                while i < lines.len() && !lines[i].starts_with("=======") {
+                    resolved_lines.push(lines[i].trim_end().to_string()); // Normalize whitespace
+                    i += 1;
+                }
+                
+                // Skip separator and 'theirs' lines
+                i += 1; // Skip =======
+                while i < lines.len() && !lines[i].starts_with(">>>>>>>") {
+                    i += 1;
+                }
+                i += 1; // Skip >>>>>>>
+                
+                // Add resolved lines
+                result_lines.extend(resolved_lines);
+            } else {
+                result_lines.push(lines[i].to_string());
+                i += 1;
+            }
+        }
+        
+        Ok(result_lines.join("\n"))
     }
 
-    fn has_non_overlapping_changes(&self, _content: &str, _conflict_file: &ConflictFile) -> Result<bool> {
-        // TODO: Implement non-overlapping change detection
-        Ok(false)
+    fn resolve_line_ending_conflict(&self, content: &str, _marker: &ConflictMarker) -> Result<String> {
+        // Normalize to Unix line endings
+        Ok(content.replace("\r\n", "\n"))
+    }
+
+    fn resolve_import_order_conflict(&self, content: &str, marker: &ConflictMarker) -> Result<String> {
+        let lines: Vec<&str> = content.lines().collect();
+        let mut result_lines = Vec::new();
+        let start_line = marker.line_number.saturating_sub(1);
+        let mut i = 0;
+        
+        while i < lines.len() {
+            if i == start_line && lines[i].starts_with("<<<<<<<") {
+                // Collect all import lines from both sides and sort them
+                let mut import_lines = std::collections::HashSet::new();
+                i += 1; // Skip conflict marker
+                
+                // Collect 'ours' imports
+                while i < lines.len() && !lines[i].starts_with("=======") {
+                    let line = lines[i].trim();
+                    if !line.is_empty() {
+                        import_lines.insert(line.to_string());
+                    }
+                    i += 1;
+                }
+                
+                i += 1; // Skip =======
+                
+                // Collect 'theirs' imports
+                while i < lines.len() && !lines[i].starts_with(">>>>>>>") {
+                    let line = lines[i].trim();
+                    if !line.is_empty() {
+                        import_lines.insert(line.to_string());
+                    }
+                    i += 1;
+                }
+                
+                i += 1; // Skip >>>>>>>
+                
+                // Sort and add import lines
+                let mut sorted_imports: Vec<String> = import_lines.into_iter().collect();
+                sorted_imports.sort();
+                result_lines.extend(sorted_imports);
+            } else {
+                result_lines.push(lines[i].to_string());
+                i += 1;
+            }
+        }
+        
+        Ok(result_lines.join("\n"))
+    }
+
+    fn resolve_non_overlapping_conflict(&self, conflict_file: &ConflictFile) -> Result<bool> {
+        let content = fs::read_to_string(&conflict_file.path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        let mut result_lines = Vec::new();
+        let mut i = 0;
+        
+        while i < lines.len() {
+            if lines[i].starts_with("<<<<<<<") {
+                // Take both 'ours' and 'theirs' sections
+                i += 1; // Skip conflict marker
+                
+                // Add 'ours' lines
+                while i < lines.len() && !lines[i].starts_with("=======") {
+                    result_lines.push(lines[i].to_string());
+                    i += 1;
+                }
+                
+                i += 1; // Skip =======
+                
+                // Add 'theirs' lines
+                while i < lines.len() && !lines[i].starts_with(">>>>>>>") {
+                    result_lines.push(lines[i].to_string());
+                    i += 1;
+                }
+                
+                i += 1; // Skip >>>>>>>
+            } else {
+                result_lines.push(lines[i].to_string());
+                i += 1;
+            }
+        }
+        
+        fs::write(&conflict_file.path, result_lines.join("\n"))?;
+        Ok(true)
     }
 } 

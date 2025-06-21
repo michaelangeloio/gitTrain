@@ -100,7 +100,7 @@ impl StackManager {
         let git_state = self.conflict_resolver.get_git_state()?;
         if !matches!(git_state, GitState::Clean) {
             return Err(TrainError::InvalidState {
-                message: format!("Cannot rebase: git is in state {:?}", git_state),
+                message: format!("Cannot rebase: git is in state {:?}. Use 'git-train resolve continue' or 'git-train resolve abort' first.", git_state),
             }.into());
         }
 
@@ -136,13 +136,24 @@ impl StackManager {
                                 print_info(&format!("Run 'git-train resolve interactive' to resolve conflicts"));
                                 print_info(&format!("Then run 'git-train resolve continue' to complete the rebase"));
                                 Err(TrainError::InvalidState {
-                                    message: "Manual conflict resolution required".to_string(),
+                                    message: format!("Manual conflict resolution required for rebase of {} onto {}", branch, onto),
                                 }.into())
                             }
                             _ => {
-                                // Offer interactive resolution
-                                self.conflict_resolver.resolve_conflicts_interactively(&conflicts).await?;
-                                Ok(())
+                                // Offer interactive resolution with better error handling
+                                match self.conflict_resolver.resolve_conflicts_interactively(&conflicts).await {
+                                    Ok(_) => Ok(()),
+                                    Err(e) => {
+                                        print_error(&format!("Interactive conflict resolution failed: {}", e));
+                                        print_info("Resolution options:");
+                                        print_info("• Run 'git-train resolve interactive' to try again");
+                                        print_info("• Run 'git-train resolve abort' to cancel the rebase");
+                                        print_info("• Resolve conflicts manually and run 'git-train resolve continue'");
+                                        Err(TrainError::InvalidState {
+                                            message: format!("Rebase of {} onto {} requires manual intervention", branch, onto),
+                                        }.into())
+                                    }
+                                }
                             }
                         }
                     }
@@ -814,18 +825,66 @@ impl StackManager {
         print_train_header("Pushing Stack");
 
         let mut stack = self.load_current_stack()?;
+        let mut push_failures = Vec::new();
+        let mut successful_pushes = Vec::new();
 
         // Push all branches in the stack
         for (branch_name, branch) in &stack.branches {
             print_info(&format!("Pushing branch: {}", branch_name));
             
+            // First try a normal push
             match run_git_command(&["push", "origin", &format!("{}:{}", branch_name, branch_name)]) {
-                Ok(_) => print_success(&format!("Pushed {}", branch_name)),
+                Ok(_) => {
+                    print_success(&format!("Pushed {}", branch_name));
+                    successful_pushes.push(branch_name.clone());
+                }
                 Err(e) => {
-                    print_error(&format!("Failed to push {}: {}", branch_name, e));
-                    continue;
+                    // Check if this is a non-fast-forward error (common after rebase)
+                    let error_msg = format!("{}", e);
+                    if error_msg.contains("non-fast-forward") || error_msg.contains("rejected") {
+                        print_warning(&format!("Branch {} was rejected (non-fast-forward)", branch_name));
+                        print_info("This is common after rebasing. Checking if force-push is safe...");
+                        
+                        // Check if we should force push safely
+                        if self.should_force_push_branch(branch_name, &stack).await? {
+                            match run_git_command(&["push", "--force-with-lease", "origin", &format!("{}:{}", branch_name, branch_name)]) {
+                                Ok(_) => {
+                                    print_success(&format!("Force-pushed {} safely", branch_name));
+                                    successful_pushes.push(branch_name.clone());
+                                }
+                                Err(force_err) => {
+                                    print_error(&format!("Force-push failed for {}: {}", branch_name, force_err));
+                                    print_warning("This might mean someone else pushed changes. Manual intervention required.");
+                                    push_failures.push((branch_name.clone(), format!("{}", force_err)));
+                                }
+                            }
+                        } else {
+                            print_warning(&format!("Skipping force-push for {} (safety check failed)", branch_name));
+                            push_failures.push((branch_name.clone(), "Force-push deemed unsafe".to_string()));
+                        }
+                    } else {
+                        print_error(&format!("Failed to push {}: {}", branch_name, e));
+                        push_failures.push((branch_name.clone(), format!("{}", e)));
+                    }
                 }
             }
+        }
+
+        // Report results
+        if !successful_pushes.is_empty() {
+            print_success(&format!("Successfully pushed {} branches: {}", 
+                successful_pushes.len(), successful_pushes.join(", ")));
+        }
+
+        if !push_failures.is_empty() {
+            print_warning(&format!("Failed to push {} branches:", push_failures.len()));
+            for (branch, error) in &push_failures {
+                println!("  ❌ {}: {}", branch, error);
+            }
+            print_info("You can:");
+            print_info("• Run 'git-train sync' to ensure branches are up to date");
+            print_info("• Force-push manually with 'git push --force-with-lease' if you're sure");
+            print_info("• Check for conflicts with remote changes");
         }
 
         // Create or update merge requests with intelligent target branch selection
@@ -835,13 +894,230 @@ impl StackManager {
         self.save_stack_state(&stack)?;
         self.current_stack = Some(stack);
 
-        print_success("Stack pushed to remote");
+        if push_failures.is_empty() {
+            print_success("Stack pushed to remote successfully");
+        } else {
+            print_warning("Stack partially pushed to remote (some branches failed)");
+        }
 
         Ok(())
     }
 
+    /// Determine if it's safe to force-push a branch
+    async fn should_force_push_branch(&self, branch_name: &str, stack: &Stack) -> Result<bool> {
+        // Safety checks for force-push
+        
+        // 1. Check if the branch exists remotely
+        let remote_exists = run_git_command(&["ls-remote", "--heads", "origin", branch_name])
+            .map(|output| !output.trim().is_empty())
+            .unwrap_or(false);
+        
+        if !remote_exists {
+            // New branch, safe to push
+            print_info(&format!("Branch {} doesn't exist remotely, safe to push", branch_name));
+            return Ok(true);
+        }
+
+        // 2. Check if this branch is part of our stack and we control it
+        if !stack.branches.contains_key(branch_name) {
+            print_warning(&format!("Branch {} is not part of our stack, unsafe to force-push", branch_name));
+            return Ok(false);
+        }
+
+        // 3. Check configuration for automatic force-push behavior
+        if self.config.conflict_resolution.auto_force_push_after_rebase {
+            print_info(&format!("Auto force-push enabled, proceeding with {} (--force-with-lease)", branch_name));
+        } else if self.config.conflict_resolution.prompt_before_force_push {
+            print_warning(&format!("Branch {} requires force-push after rebase", branch_name));
+            print_info("This will overwrite the remote branch with your rebased version.");
+            
+            let proceed = confirm_action(&format!("Force-push {} safely?", branch_name))?;
+            if !proceed {
+                print_info("Skipping force-push. You can push manually later if needed.");
+                return Ok(false);
+            }
+        } else {
+            // Neither auto nor prompt enabled, skip force-push
+            print_info(&format!("Force-push not configured for automatic mode, skipping {}", branch_name));
+            return Ok(false);
+        }
+
+        // 4. Additional safety: ensure we're not too far ahead (sanity check)
+        match run_git_command(&["rev-list", "--count", &format!("origin/{}..{}", branch_name, branch_name)]) {
+            Ok(output) => {
+                if let Ok(ahead_count) = output.trim().parse::<u32>() {
+                    if ahead_count > 20 {
+                        print_warning(&format!("Branch {} is {} commits ahead of remote, this seems unusual", branch_name, ahead_count));
+                        print_warning("This might indicate a problem. Manual review recommended.");
+                        return Ok(false);
+                    }
+                }
+            }
+            Err(_) => {
+                // Can't determine, err on the side of caution
+                print_info("Could not determine commit difference, proceeding with caution");
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Check for and attempt to recover from invalid git states
+    pub async fn check_and_recover_git_state(&self) -> Result<()> {
+        let git_state = self.conflict_resolver.get_git_state()?;
+        
+        match git_state {
+            GitState::Clean => Ok(()),
+            GitState::Rebasing | GitState::Merging | GitState::CherryPicking => {
+                print_warning(&format!("Git is in state {:?}. Recovery options:", git_state));
+                
+                if let Some(conflicts) = self.conflict_resolver.detect_conflicts()? {
+                    print_info(&format!("Found {} conflicted files that need resolution", conflicts.files.len()));
+                    self.conflict_resolver.print_conflict_summary(&conflicts);
+                    
+                    let options = vec![
+                        "Try to resolve conflicts automatically",
+                        "Resolve conflicts interactively", 
+                        "Abort the current operation",
+                        "Continue with manual resolution later"
+                    ];
+                    
+                    let choice = crate::utils::select_from_list(&options, "How would you like to proceed?")?;
+                    
+                    match choice {
+                        0 => {
+                            if self.conflict_resolver.auto_resolve_conflicts(&conflicts).await? {
+                                self.conflict_resolver.verify_conflicts_resolved().await?;
+                                print_success("Automatically resolved conflicts and completed operation");
+                                Ok(())
+                            } else {
+                                print_warning("Automatic resolution failed. Please resolve manually or abort.");
+                                Err(TrainError::InvalidState {
+                                    message: "Automatic conflict resolution failed".to_string(),
+                                }.into())
+                            }
+                        }
+                        1 => {
+                            self.conflict_resolver.resolve_conflicts_interactively(&conflicts).await
+                        }
+                        2 => {
+                            self.conflict_resolver.abort_current_operation()?;
+                            print_success("Aborted current operation. Repository is now clean.");
+                            Ok(())
+                        }
+                        3 => {
+                            print_info("Resolution deferred. Use 'git-train resolve interactive' when ready.");
+                            Err(TrainError::InvalidState {
+                                message: "Manual conflict resolution deferred".to_string(),
+                            }.into())
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    // No conflicts detected - this could be stale state files
+                    print_info("No conflicts detected. This might be stale git state files.");
+                    print_info("Attempting to clean up stale state and continue...");
+                    
+                    // The get_git_state() call should have already cleaned up stale files,
+                    // so let's check the state again after cleanup
+                    let new_git_state = self.conflict_resolver.get_git_state()?;
+                    
+                    if matches!(new_git_state, GitState::Clean) {
+                        print_success("Successfully cleaned up stale git state files. Repository is now clean.");
+                        Ok(())
+                    } else {
+                        // Still in problematic state, try to continue the operation
+                        print_info("Repository still shows active operation. Attempting to continue...");
+                        match git_state {
+                            GitState::Rebasing => {
+                                match run_git_command(&["rebase", "--continue"]) {
+                                    Ok(_) => {
+                                        print_success("Successfully continued rebase");
+                                        Ok(())
+                                    }
+                                    Err(_) => {
+                                        print_warning("Could not continue rebase. Offering to abort...");
+                                        if confirm_action("Abort the rebase?")? {
+                                            run_git_command(&["rebase", "--abort"])?;
+                                            print_success("Rebase aborted. Repository is now clean.");
+                                            Ok(())
+                                        } else {
+                                            Err(TrainError::InvalidState {
+                                                message: "Could not continue interrupted rebase".to_string(),
+                                            }.into())
+                                        }
+                                    }
+                                }
+                            }
+                            GitState::Merging => {
+                                match run_git_command(&["commit", "--no-edit"]) {
+                                    Ok(_) => {
+                                        print_success("Successfully completed merge");
+                                        Ok(())
+                                    }
+                                    Err(_) => {
+                                        print_warning("Could not complete merge. Offering to abort...");
+                                        if confirm_action("Abort the merge?")? {
+                                            run_git_command(&["merge", "--abort"])?;
+                                            print_success("Merge aborted. Repository is now clean.");
+                                            Ok(())
+                                        } else {
+                                            Err(TrainError::InvalidState {
+                                                message: "Could not complete interrupted merge".to_string(),
+                                            }.into())
+                                        }
+                                    }
+                                }
+                            }
+                            GitState::CherryPicking => {
+                                match run_git_command(&["cherry-pick", "--continue"]) {
+                                    Ok(_) => {
+                                        print_success("Successfully continued cherry-pick");
+                                        Ok(())
+                                    }
+                                    Err(_) => {
+                                        print_warning("Could not continue cherry-pick. Offering to abort...");
+                                        if confirm_action("Abort the cherry-pick?")? {
+                                            run_git_command(&["cherry-pick", "--abort"])?;
+                                            print_success("Cherry-pick aborted. Repository is now clean.");
+                                            Ok(())
+                                        } else {
+                                            Err(TrainError::InvalidState {
+                                                message: "Could not continue interrupted cherry-pick".to_string(),
+                                            }.into())
+                                        }
+                                    }
+                                }
+                            }
+                            _ => Ok(()),
+                        }
+                    }
+                }
+            }
+            GitState::Conflicted => {
+                print_warning("Repository has unresolved conflicts.");
+                if let Some(conflicts) = self.conflict_resolver.detect_conflicts()? {
+                    self.conflict_resolver.resolve_conflicts_interactively(&conflicts).await
+                } else {
+                    Err(TrainError::InvalidState {
+                        message: "Repository appears to have conflicts but none were detected".to_string(),
+                    }.into())
+                }
+            }
+        }
+    }
+
     pub async fn sync_with_remote(&mut self) -> Result<()> {
         print_train_header("Syncing with Remote");
+
+        // First check and attempt to recover from any invalid git state
+        if let Err(e) = self.check_and_recover_git_state().await {
+            print_error(&format!("Cannot sync: {}", e));
+            print_info("Please resolve the git state issue first:");
+            print_info("• Use 'git-train resolve interactive' for conflict resolution");
+            print_info("• Use 'git-train resolve abort' to cancel interrupted operations");
+            return Err(e);
+        }
 
         let stack = self.load_current_stack()?;
         let current_branch = self.get_current_branch()?;
@@ -854,11 +1130,28 @@ impl StackManager {
         run_git_command(&["checkout", &stack.base_branch])?;
         run_git_command(&["pull", "origin", &stack.base_branch])?;
 
-        // Rebase all stack branches
+        // Rebase all stack branches with better error handling
         let mut updated_stack = stack.clone();
         let hierarchy = self.build_branch_hierarchy(&stack);
         
-        self.rebase_branch_hierarchy(&mut updated_stack, &hierarchy, &stack.base_branch).await?;
+        match self.rebase_branch_hierarchy(&mut updated_stack, &hierarchy, &stack.base_branch).await {
+            Ok(_) => {
+                print_success("Successfully rebased all branches");
+            }
+            Err(e) => {
+                print_error(&format!("Some branches failed to rebase: {}", e));
+                print_info("You can:");
+                print_info("• Run 'git-train resolve interactive' to handle conflicts");
+                print_info("• Run 'git-train sync' again after resolving issues");
+                
+                // Try to return to a safe state
+                if let Err(_) = run_git_command(&["checkout", &current_branch]) {
+                    print_warning(&format!("Could not return to original branch '{}'. You may need to checkout manually.", current_branch));
+                }
+                
+                return Err(e);
+            }
+        }
 
         // Update merge request targets if GitLab client is available
         if self.gitlab_client.is_some() {
@@ -878,7 +1171,7 @@ impl StackManager {
         Ok(())
     }
 
-    fn get_current_branch(&self) -> Result<String> {
+    pub fn get_current_branch(&self) -> Result<String> {
         run_git_command(&["branch", "--show-current"])
     }
 
@@ -886,12 +1179,10 @@ impl StackManager {
         run_git_command(&["rev-parse", "HEAD"])
     }
 
-    fn has_uncommitted_changes(&self) -> Result<bool> {
+    pub fn has_uncommitted_changes(&self) -> Result<bool> {
         let output = run_git_command(&["status", "--porcelain"])?;
         Ok(!output.trim().is_empty())
     }
-
-
 
     fn ensure_clean_working_directory(&self) -> Result<()> {
         if self.has_uncommitted_changes()? {
@@ -1182,6 +1473,8 @@ impl StackManager {
     }
 
     async fn rebase_branch_hierarchy(&self, stack: &mut Stack, hierarchy: &HashMap<String, Vec<String>>, base_branch: &str) -> Result<()> {
+        let mut failed_branches = Vec::new();
+        
         // Rebase branches in order of dependency
         if let Some(children) = hierarchy.get(base_branch) {
             for child in children {
@@ -1190,29 +1483,54 @@ impl StackManager {
                 run_git_command(&["checkout", child])?;
                 
                 // Use smart rebase with conflict resolution
-                if let Err(e) = self.smart_rebase(child, base_branch).await {
-                    print_error(&format!("Failed to rebase {}: {}", child, e));
-                    // Continue with other branches
-                    continue;
+                match self.smart_rebase(child, base_branch).await {
+                    Ok(_) => {
+                        // Update stack state on successful rebase
+                        let new_commit = self.get_current_commit_hash()?;
+                        if let Some(branch) = stack.branches.get_mut(child) {
+                            branch.commit_hash = new_commit;
+                            branch.updated_at = Utc::now();
+                        }
+                        print_success(&format!("Rebased {}", child));
+                        
+                        // Recursively rebase children
+                        if let Err(e) = Box::pin(self.rebase_branch_hierarchy(stack, hierarchy, child)).await {
+                            print_error(&format!("Failed to rebase children of {}: {}", child, e));
+                            // Don't fail the entire operation, but track the error
+                            failed_branches.push(format!("children of {}", child));
+                        }
+                    }
+                    Err(e) => {
+                        print_error(&format!("Failed to rebase {}: {}", child, e));
+                        failed_branches.push(child.clone());
+                        
+                        // Check if we're in a state that needs recovery
+                        let git_state = self.conflict_resolver.get_git_state()?;
+                        if !matches!(git_state, GitState::Clean) {
+                            print_warning(&format!("Git is in state {:?} after failed rebase of {}", git_state, child));
+                            print_info("Stopping hierarchy rebase. Resolve conflicts and run sync again.");
+                            
+                            if !failed_branches.is_empty() {
+                                return Err(TrainError::GitError {
+                                    message: format!("Rebase failed for branch '{}'. Repository needs attention.", child),
+                                }.into());
+                            }
+                        }
+                        
+                        // Continue with other branches if git state is clean
+                        continue;
+                    }
                 }
-                
-                // Update stack state on successful rebase
-                let new_commit = self.get_current_commit_hash()?;
-                if let Some(branch) = stack.branches.get_mut(child) {
-                    branch.commit_hash = new_commit;
-                    branch.updated_at = Utc::now();
-                }
-                print_success(&format!("Rebased {}", child));
-                
-                // Recursively rebase children
-                Box::pin(self.rebase_branch_hierarchy(stack, hierarchy, child)).await?;
             }
+        }
+
+        if !failed_branches.is_empty() {
+            print_warning(&format!("The following branches failed to rebase: {}", failed_branches.join(", ")));
+            print_info("You may need to resolve conflicts manually for these branches.");
         }
 
         Ok(())
     }
-
-
 
     /// Intelligently determine the optimal target branch for a given branch in the stack
     async fn determine_optimal_target_branch(&self, branch_name: &str, stack: &Stack, gitlab_client: &GitLabClient) -> Result<String> {
@@ -1374,7 +1692,7 @@ impl StackManager {
         Ok(())
     }
 
-    fn load_current_stack(&self) -> Result<Stack> {
+    pub fn load_current_stack(&self) -> Result<Stack> {
         let current_file = self.train_dir.join("current.json");
         if !current_file.exists() {
             return Err(TrainError::StackError {

@@ -27,6 +27,8 @@ pub struct ConflictResolutionConfig {
     pub backup_on_conflict: bool,
     pub max_retry_attempts: u32,
     pub prompt_before_force_push: bool,
+    #[serde(default)]
+    pub auto_force_push_after_rebase: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +100,7 @@ impl Default for ConflictResolutionConfig {
             backup_on_conflict: true,
             max_retry_attempts: 3,
             prompt_before_force_push: true,
+            auto_force_push_after_rebase: false,
         }
     }
 }

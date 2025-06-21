@@ -77,6 +77,9 @@ pub enum Commands {
     /// Conflict resolution commands
     #[command(subcommand)]
     Resolve(ResolveCommands),
+
+    /// Check repository and stack health
+    Health,
 }
 
 #[derive(Subcommand)]
@@ -98,6 +101,12 @@ pub enum ConfigCommands {
         /// Strategy: 'never', 'simple', or 'smart'
         strategy: String,
     },
+    
+    /// Set force-push behavior
+    SetForcePush {
+        /// Mode: 'auto', 'prompt', or 'never'
+        mode: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -116,4 +125,10 @@ pub enum ResolveCommands {
     
     /// Continue after resolving conflicts manually
     Continue,
+    
+    /// Attempt to recover from interrupted git operations
+    Recover,
+    
+    /// Force cleanup of all stale git state files
+    Cleanup,
 } 
