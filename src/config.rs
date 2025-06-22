@@ -38,7 +38,7 @@ pub struct GitConfig {
     pub verify_signatures: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AutoResolveStrategy {
     /// Never auto-resolve, always prompt user
     Never,

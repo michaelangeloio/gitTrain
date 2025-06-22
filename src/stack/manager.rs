@@ -122,104 +122,97 @@ impl StackManager {
             }.into());
         }
 
+        // Stash any uncommitted changes instead of requiring clean working directory
+        let has_changes = self.has_uncommitted_changes()?;
+        let stash_created = if has_changes {
+            self.git_repo.run(&["stash", "push", "-m", &format!("git-train: auto-stash before rebase {}", branch)])?;
+            print_info("Stashed uncommitted changes");
+            true
+        } else {
+            false
+        };
+
         // Checkout the branch we want to rebase
         self.git_repo.run(&["checkout", branch])?;
 
-        // Create backup if configured
-        if self.config.conflict_resolution.backup_on_conflict {
+        // Only create backup for high-risk operations (interactive rebases or when configured)
+        let should_backup = self.config.conflict_resolution.backup_on_conflict && 
+                           self.config.conflict_resolution.auto_resolve_strategy == crate::config::AutoResolveStrategy::Never;
+        
+        if should_backup {
             let backup_branch = self.create_unique_backup_name(branch)?;
             self.git_repo.run(&["branch", &backup_branch])?;
-            print_info(&format!("Created backup branch: {}", backup_branch));
+            print_info(&format!("Created backup branch: {} (high-risk operation)", backup_branch));
+        } else {
+            print_info(&format!("Using git reflog for recovery (original commit: {})", 
+                self.git_repo.get_commit_hash_for_branch(branch)?[..8].to_string()));
         }
 
         // Attempt the rebase
-        match self.git_repo.run(&["rebase", onto]) {
+        let rebase_result = self.git_repo.run(&["rebase", onto]);
+
+        // Restore stashed changes if we created a stash
+        if stash_created {
+            if let Err(_) = self.git_repo.run(&["stash", "pop"]) {
+                print_warning("Could not automatically restore stashed changes. Run 'git stash pop' manually if needed.");
+            } else {
+                print_info("Restored stashed changes");
+            }
+        }
+
+        match rebase_result {
             Ok(_) => {
                 print_success(&format!("Rebased {} onto {} successfully", branch, onto));
                 Ok(())
             }
-            Err(rebase_err) => {
-                // If rebase fails because of a need for an editor (e.g. interactive rebase),
-                // and we are in a non-interactive environment, we should consider it a failure
-                // that requires manual intervention.
-                if rebase_err.to_string().contains("could not execute editor") {
-                    return Err(TrainError::GitError {
-                        message: format!(
-                            "Rebase of {} onto {} requires an interactive editor, but none is available.",
-                            branch, onto
-                        ),
-                    }
-                    .into());
-                }
-
-                // Check if we have conflicts
-                let conflicts = self.conflict_resolver.detect_conflicts()?;
-                if let Some(conflicts) = conflicts {
-                    print_info(&format!(
-                        "Conflicts detected during rebase of {} onto {}",
-                        branch, onto
-                    ));
-
-                    // Try automatic resolution first
-                    if self
-                        .conflict_resolver
-                        .auto_resolve_conflicts(&conflicts)
-                        .await?
-                    {
-                        // Continue the rebase
-                        self.git_repo.run(&["rebase", "--continue"])?;
-                        print_success("Auto-resolved conflicts and completed rebase");
-                        Ok(())
-                    } else {
-                        // Fall back to interactive resolution
+            Err(_rebase_err) => {
+                // Check if we're in a conflict state
+                let git_state = self.conflict_resolver.get_git_state()?;
+                
+                if matches!(git_state, GitState::Rebasing | GitState::Conflicted) {
+                    // We have conflicts during rebase
+                    let conflict_info = self.conflict_resolver.detect_conflicts()?;
+                    if let Some(conflict_info) = conflict_info {
+                        print_info(&format!("Conflicts detected in {} files during rebase", conflict_info.files.len()));
+                        
+                        // Try to resolve conflicts automatically if enabled
                         match self.config.conflict_resolution.auto_resolve_strategy {
                             crate::config::AutoResolveStrategy::Never => {
-                                print_warning(
-                                    "Auto-resolution disabled. Please resolve conflicts manually:",
-                                );
-                                print_info(
-                                    "Re-run 'git-train sync' to continue with manual conflict resolution",
-                                );
+                                print_warning("Auto-resolution disabled. Please resolve conflicts manually:");
+                                print_info("Re-run 'git-train sync' to continue with manual conflict resolution");
                                 Err(TrainError::InvalidState {
                                     message: format!("Manual conflict resolution required for rebase of {} onto {}", branch, onto),
                                 }.into())
                             }
                             _ => {
-                                // Offer interactive resolution with better error handling
-                                match self
-                                    .conflict_resolver
-                                    .resolve_conflicts_interactively(&conflicts)
-                                    .await
-                                {
-                                    Ok(_) => Ok(()),
-                                    Err(e) => {
-                                        print_error(&format!(
-                                            "Interactive conflict resolution failed: {}",
-                                            e
-                                        ));
-                                        print_info("Resolution options:");
-                                        print_info(
-                                            "• Re-run 'git-train sync' to try conflict resolution again",
-                                        );
-                                        print_info("• Resolve conflicts manually and re-run 'git-train sync'");
-                                        Err(TrainError::InvalidState {
-                                            message: format!(
-                                                "Rebase of {} onto {} requires manual intervention",
-                                                branch, onto
-                                            ),
-                                        }
-                                        .into())
+                                // Try auto-resolve conflicts
+                                match self.conflict_resolver.auto_resolve_conflicts(&conflict_info).await {
+                                    Ok(true) => {
+                                        print_success("Conflicts resolved automatically");
+                                        self.git_repo.run(&["rebase", "--continue"])?;
+                                        print_success(&format!("Completed rebase of {} onto {}", branch, onto));
+                                        Ok(())
+                                    }
+                                    Ok(false) | Err(_) => {
+                                        print_warning("Automatic conflict resolution failed. Falling back to interactive resolution.");
+                                        self.conflict_resolver.resolve_conflicts_interactively(&conflict_info).await?;
+                                        Ok(())
                                     }
                                 }
                             }
                         }
+                    } else {
+                        // No conflicts detected but rebase failed - abort and return error
+                        self.git_repo.run(&["rebase", "--abort"]).ok(); // Best effort abort
+                        Err(TrainError::GitError {
+                            message: format!("Rebase of {} onto {} failed", branch, onto),
+                        }.into())
                     }
                 } else {
                     // Rebase failed for other reasons
                     Err(TrainError::GitError {
                         message: format!("Rebase of {} onto {} failed", branch, onto),
-                    }
-                    .into())
+                    }.into())
                 }
             }
         }
@@ -428,7 +421,6 @@ impl StackManager {
         
         // Get all ancestor branches (earlier branches in the stack)
         let ancestors = self.get_ancestor_branches(stack, current_branch);
-        print_info(&format!("DEBUG: Found {} ancestor branches: {:?}", ancestors.len(), ancestors));
         
         for ancestor in ancestors {
             // Get files that were introduced or modified in this ancestor branch
@@ -500,10 +492,16 @@ impl StackManager {
     ) -> Result<()> {
         print_info("Detected files from earlier branches in the stack. Propagating changes...");
         
-        // Create a backup of the current branch
-        let backup_branch = self.create_unique_backup_name(current_branch)?;
-        self.git_repo.run(&["branch", &backup_branch])?;
-        print_info(&format!("Created backup branch: {}", backup_branch));
+        // Stash any uncommitted changes in working directory
+        let has_uncommitted = self.has_uncommitted_changes()?;
+        if has_uncommitted {
+            self.git_repo.run(&["stash", "push", "-m", "git-train: auto-stash before propagation"])?;
+            print_info("Stashed uncommitted changes");
+        }
+
+        // Log original state for recovery via reflog
+        print_info(&format!("Original state can be recovered via git reflog (branch: {}, commit: {})", 
+            current_branch, self.git_repo.get_commit_hash_for_branch(current_branch)?[..8].to_string()));
 
         // Get the commit message to use
         let commit_message = if let Some(msg) = new_message {
@@ -548,7 +546,7 @@ impl StackManager {
 
         // Apply changes to each earlier branch
         for (target_branch, files) in branches_to_update {
-            print_info(&format!("Applying changes to earlier branch: {}", target_branch));
+            print_info(&format!("Applying changes to earlier branch: {} (reflog available for recovery)", target_branch));
             
             // Switch to the target branch
             self.git_repo.run(&["checkout", target_branch])?;
@@ -572,6 +570,15 @@ impl StackManager {
             
             // Commit the changes
             let propagated_message = format!("propagate: {} (from {})", commit_message.trim(), current_branch);
+            
+            // Check if there are any staged changes before committing
+            let staged_changes = self.git_repo.run(&["diff", "--cached", "--name-only"])?;
+            
+            if staged_changes.trim().is_empty() {
+                print_warning(&format!("No staged changes to commit for branch '{}'", target_branch));
+                continue; // Skip this branch if no changes to commit
+            }
+            
             self.git_repo.run(&["commit", "-m", &propagated_message])?;
             
             // Update the stack state
@@ -633,6 +640,15 @@ impl StackManager {
         if let Some(earliest) = earliest_branch {
             print_info("Rebasing downstream branches...");
             self.rebase_downstream_branches_from(&mut updated_stack, earliest).await?;
+        }
+
+        // Restore stashed changes if we created a stash
+        if has_uncommitted {
+            if let Err(_) = self.git_repo.run(&["stash", "pop"]) {
+                print_warning("Could not automatically restore stashed changes. Run 'git stash pop' manually if needed.");
+            } else {
+                print_info("Restored stashed changes");
+            }
         }
 
         // Save the updated stack
@@ -709,10 +725,9 @@ impl StackManager {
 
     /// Perform standard amend operation for files that don't need earlier branch propagation
     async fn perform_standard_amend(&mut self, stack: &Stack, current_branch: &str, new_message: Option<&str>) -> Result<()> {
-        // Create a backup before making changes
-        let backup_branch = self.create_unique_backup_name(current_branch)?;
-        self.git_repo.run(&["branch", &backup_branch])?;
-        print_info(&format!("Created backup branch: {}", backup_branch));
+        // Log original state for recovery via reflog
+        print_info(&format!("Original state can be recovered via git reflog (commit: {})", 
+            self.get_current_commit_hash()?[..8].to_string()));
 
         // Amend the current commit
         if let Some(message) = new_message {
