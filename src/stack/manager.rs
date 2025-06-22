@@ -2296,8 +2296,8 @@ impl StackManager {
         // If this branch already has an MR, check if its target is still valid
         if let Some(mr_iid) = branch.mr_iid {
             if let Ok(mr) = gitlab_client.get_merge_request(mr_iid).await {
-                // If the target branch of the MR is a valid branch in our stack, keep it
-                if stack.branches.contains_key(&mr.target_branch) {
+                // If the target branch is either in our stack or is the base branch, keep it
+                if stack.branches.contains_key(&mr.target_branch) || mr.target_branch == stack.base_branch {
                     print_info(&format!(
                         "Keeping existing MR target '{}' for branch '{}'",
                         mr.target_branch, branch_name
