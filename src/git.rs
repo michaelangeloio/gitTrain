@@ -41,12 +41,18 @@ impl GitRepository {
     }
 
     pub fn get_current_commit_hash(&self) -> Result<String> {
-        self.run(&["rev-parse", "HEAD"])
+        let output = self.run(&["rev-parse", "HEAD"])?;
+        Ok(output.trim().to_string())
+    }
+
+    pub fn get_commit_hash_for_branch(&self, branch_name: &str) -> Result<String> {
+        let output = self.run(&["rev-parse", branch_name])?;
+        Ok(output.trim().to_string())
     }
 
     pub fn has_uncommitted_changes(&self) -> Result<bool> {
         let output = self.run(&["status", "--porcelain"])?;
-        Ok(!output.trim().is_empty())
+        Ok(!output.is_empty())
     }
 }
 

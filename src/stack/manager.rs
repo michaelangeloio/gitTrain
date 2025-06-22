@@ -9,7 +9,7 @@ use crate::config::TrainConfig;
 use crate::conflict::{ConflictResolver, GitState};
 use crate::errors::TrainError;
 use crate::git::GitRepository;
-use crate::gitlab::{CreateMergeRequestRequest, GitLabClient};
+use crate::gitlab::{CreateMergeRequestRequest, GitLabApi, GitLabClient};
 use crate::stack::state::StackState;
 use crate::stack::types::{Stack, StackBranch};
 use crate::ui::{
@@ -21,7 +21,7 @@ use crate::utils::{create_backup_name, sanitize_branch_name};
 pub struct StackManager {
     stack_state: StackState,
     current_stack: Option<Stack>,
-    gitlab_client: Option<GitLabClient>,
+    gitlab_client: Option<Box<dyn GitLabApi + Send + Sync>>,
     config: TrainConfig,
     conflict_resolver: ConflictResolver,
     git_repo: GitRepository,
@@ -30,8 +30,16 @@ pub struct StackManager {
 impl StackManager {
     pub async fn new_with_config(config: TrainConfig) -> Result<Self> {
         let git_repo = GitRepository::new_from_current_dir()?;
+        Self::new_with_services(config, git_repo).await
+    }
+
+    pub async fn new_with_git_repo(config: TrainConfig, git_repo: GitRepository) -> Result<Self> {
+        Self::new_with_services(config, git_repo).await
+    }
+
+    async fn new_with_services(config: TrainConfig, git_repo: GitRepository) -> Result<Self> {
         let git_dir = git_repo.run(&["rev-parse", "--git-dir"])?;
-        let git_dir_path = std::path::PathBuf::from(git_dir.trim()).canonicalize()?;
+        let git_dir_path = std::path::PathBuf::from(git_dir.trim());
 
         let train_dir = git_dir_path.join("train");
 
@@ -45,7 +53,7 @@ impl StackManager {
         let gitlab_client = match GitLabClient::new(git_repo.clone()).await {
             Ok(client) => {
                 print_info("GitLab integration initialized");
-                Some(client)
+                Some(Box::new(client) as Box<dyn GitLabApi + Send + Sync>)
             }
             Err(e) => {
                 print_warning(&format!("GitLab integration not available: {}", e));
@@ -68,6 +76,10 @@ impl StackManager {
         })
     }
 
+    pub fn set_gitlab_client(&mut self, client: Box<dyn GitLabApi + Send + Sync>) {
+        self.gitlab_client = Some(client);
+    }
+
     pub fn get_conflict_resolver(&self) -> &ConflictResolver {
         &self.conflict_resolver
     }
@@ -82,6 +94,9 @@ impl StackManager {
             }.into());
         }
 
+        // Checkout the branch we want to rebase
+        self.git_repo.run(&["checkout", branch])?;
+
         // Create backup if configured
         if self.config.conflict_resolution.backup_on_conflict {
             let backup_branch = create_backup_name(branch);
@@ -95,9 +110,23 @@ impl StackManager {
                 print_success(&format!("Rebased {} onto {} successfully", branch, onto));
                 Ok(())
             }
-            Err(_) => {
+            Err(rebase_err) => {
+                // If rebase fails because of a need for an editor (e.g. interactive rebase),
+                // and we are in a non-interactive environment, we should consider it a failure
+                // that requires manual intervention.
+                if rebase_err.to_string().contains("could not execute editor") {
+                    return Err(TrainError::GitError {
+                        message: format!(
+                            "Rebase of {} onto {} requires an interactive editor, but none is available.",
+                            branch, onto
+                        ),
+                    }
+                    .into());
+                }
+
                 // Check if we have conflicts
-                if let Some(conflicts) = self.conflict_resolver.detect_conflicts()? {
+                let conflicts = self.conflict_resolver.detect_conflicts()?;
+                if let Some(conflicts) = conflicts {
                     print_info(&format!(
                         "Conflicts detected during rebase of {} onto {}",
                         branch, onto
@@ -816,7 +845,7 @@ impl StackManager {
             if let Some(branch) = stack.branches.get(branch_name) {
                 let mut stack_mut = stack.clone();
                 self.create_or_update_mr_with_smart_targeting_and_store(
-                    gitlab_client,
+                    gitlab_client.as_ref(),
                     branch_name,
                     branch,
                     &mut stack_mut,
@@ -1275,9 +1304,6 @@ impl StackManager {
         let stack = self.get_or_load_current_stack()?;
         let current_branch = self.get_current_branch()?;
 
-        // Ensure working directory is clean
-        self.ensure_clean_working_directory()?;
-
         // Update the base branch
         print_info(&format!("Updating base branch: {}", stack.base_branch));
         self.git_repo.run(&["checkout", &stack.base_branch])?;
@@ -1287,26 +1313,96 @@ impl StackManager {
         let mut updated_stack = stack.clone();
         let hierarchy = self.build_branch_hierarchy(&stack);
 
-        match self
-            .rebase_branch_hierarchy(&mut updated_stack, &hierarchy, &stack.base_branch)
-            .await
-        {
-            Ok(_) => {
-                print_success("Successfully rebased all branches");
-            }
-            Err(e) => {
-                print_error(&format!("Some branches failed to rebase: {}", e));
-                print_info("You can:");
-                print_info("• Re-run 'git-train sync' to handle conflicts");
-                print_info("• Run 'git-train sync' again after resolving issues");
+        let rebase_result = {
+            let mut rebased_branches = std::collections::HashSet::new();
 
-                // Try to return to a safe state
-                if self.git_repo.run(&["checkout", &current_branch]).is_err() {
-                    print_warning(&format!("Could not return to original branch '{}'. You may need to checkout manually.", current_branch));
+            // Start with branches that have the base branch as a parent
+            let mut branches_to_rebase: Vec<String> = stack
+                .branches
+                .keys()
+                .filter(|k| {
+                    stack.branches.get(*k).and_then(|b| b.parent.as_ref())
+                        == Some(&stack.base_branch)
+                })
+                .cloned()
+                .collect();
+
+            // Sort for consistent order
+            branches_to_rebase.sort();
+
+            let mut all_rebased_ok = true;
+            let mut first_error: Option<anyhow::Error> = None;
+
+            while let Some(branch_name) = branches_to_rebase.pop() {
+                if rebased_branches.contains(&branch_name) {
+                    continue;
                 }
 
-                return Err(e);
+                let parent_branch_name = stack
+                    .branches
+                    .get(&branch_name)
+                    .and_then(|b| b.parent.clone())
+                    .unwrap_or_else(|| stack.base_branch.to_string());
+
+                self.git_repo.run(&["checkout", &branch_name])?;
+
+                match self.smart_rebase(&branch_name, &parent_branch_name).await {
+                    Ok(_) => {
+                        // Update commit hash
+                        if let Some(branch) = updated_stack.branches.get_mut(&branch_name) {
+                            branch.commit_hash = self.get_current_commit_hash()?;
+                            branch.updated_at = Utc::now();
+                        }
+                        rebased_branches.insert(branch_name.clone());
+
+                        // Add children of this branch to the queue
+                        if let Some(children) = hierarchy.get(&branch_name) {
+                            for child in children {
+                                branches_to_rebase.push(child.clone());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        print_error(&format!("Failed to rebase branch '{}': {}", branch_name, e));
+                        all_rebased_ok = false;
+                        
+                        // Store the first error, especially if it's a conflict resolution error
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                        
+                        // Don't proceed with children if parent fails
+                    }
+                }
             }
+
+            if all_rebased_ok {
+                Ok(())
+            } else {
+                // Return the specific error if available, otherwise use generic message
+                if let Some(original_error) = first_error {
+                    Err(original_error)
+                } else {
+                    Err(TrainError::GitError {
+                        message: "One or more branches failed to rebase".to_string(),
+                    }
+                    .into())
+                }
+            }
+        };
+
+        if let Err(e) = rebase_result {
+            print_error(&format!("Some branches failed to rebase: {}", e));
+            print_info("You can:");
+            print_info("• Re-run 'git-train sync' to handle conflicts");
+            print_info("• Run 'git-train sync' again after resolving issues");
+
+            // Try to return to a safe state
+            if self.git_repo.run(&["checkout", &current_branch]).is_err() {
+                print_warning(&format!("Could not return to original branch '{}'. You may need to checkout manually.", current_branch));
+            }
+
+            return Err(e);
         }
 
         // Update merge request targets if GitLab client is available
@@ -1427,7 +1523,7 @@ impl StackManager {
             for (branch_name, branch) in branches_to_process {
                 match self
                     .create_or_update_mr_with_smart_targeting_and_store(
-                        gitlab_client,
+                        gitlab_client.as_ref(),
                         &branch_name,
                         &branch,
                         stack,
@@ -1456,7 +1552,7 @@ impl StackManager {
                 if branch.mr_iid.is_some() {
                     match self
                         .create_or_update_mr_with_smart_targeting_and_store(
-                            gitlab_client,
+                            gitlab_client.as_ref(),
                             &branch_name,
                             &branch,
                             stack,
@@ -1588,20 +1684,12 @@ impl StackManager {
     async fn propagate_changes(&self, stack: &mut Stack, changed_branch: &str) -> Result<()> {
         let hierarchy = self.build_branch_hierarchy(stack);
         if let Some(children) = hierarchy.get(changed_branch) {
-            for child_branch_name in children {
+            for child_branch in children {
                 print_info(&format!(
                     "Propagating changes to child branch: {}",
-                    child_branch_name
+                    child_branch
                 ));
-
-                self.git_repo.run(&["checkout", child_branch_name])?;
-                self.smart_rebase(child_branch_name, changed_branch).await?;
-
-                // Update commit hash
-                if let Some(branch) = stack.branches.get_mut(child_branch_name) {
-                    branch.commit_hash = self.get_current_commit_hash()?;
-                    branch.updated_at = Utc::now();
-                }
+                self.smart_rebase(child_branch, changed_branch).await?;
             }
         }
         Ok(())
@@ -1622,86 +1710,12 @@ impl StackManager {
         hierarchy
     }
 
-    async fn rebase_branch_hierarchy(
-        &self,
-        stack: &mut Stack,
-        hierarchy: &HashMap<String, Vec<String>>,
-        base_branch: &str,
-    ) -> Result<()> {
-        let mut rebased_branches = std::collections::HashSet::new();
-
-        // Start with branches that have the base branch as a parent
-        let mut branches_to_rebase: Vec<String> = hierarchy
-            .iter()
-            .filter(|(child, _)| {
-                stack.branches.get(*child).and_then(|b| b.parent.as_ref())
-                    == Some(&base_branch.to_string())
-            })
-            .map(|(child, _)| child.clone())
-            .collect();
-
-        // Sort for consistent order
-        branches_to_rebase.sort();
-
-        let mut all_rebased_ok = true;
-
-        while let Some(branch_name) = branches_to_rebase.pop() {
-            if rebased_branches.contains(&branch_name) {
-                continue;
-            }
-
-            let parent_branch_name = stack
-                .branches
-                .get(&branch_name)
-                .and_then(|b| b.parent.clone())
-                .unwrap_or_else(|| base_branch.to_string());
-
-            print_info(&format!(
-                "Rebasing '{}' onto '{}'",
-                branch_name, parent_branch_name
-            ));
-            self.git_repo.run(&["checkout", &branch_name])?;
-
-            match self.smart_rebase(&branch_name, &parent_branch_name).await {
-                Ok(_) => {
-                    // Update commit hash
-                    if let Some(branch) = stack.branches.get_mut(&branch_name) {
-                        branch.commit_hash = self.get_current_commit_hash()?;
-                        branch.updated_at = Utc::now();
-                    }
-                    rebased_branches.insert(branch_name.clone());
-
-                    // Add children of this branch to the queue
-                    if let Some(children) = hierarchy.get(&branch_name) {
-                        for child in children {
-                            branches_to_rebase.push(child.clone());
-                        }
-                    }
-                }
-                Err(e) => {
-                    print_error(&format!("Failed to rebase branch '{}': {}", branch_name, e));
-                    all_rebased_ok = false;
-                    // Don't proceed with children if parent fails
-                }
-            }
-        }
-
-        if all_rebased_ok {
-            Ok(())
-        } else {
-            Err(TrainError::GitError {
-                message: "One or more branches failed to rebase".to_string(),
-            }
-            .into())
-        }
-    }
-
     /// Intelligently determine the optimal target branch for a given branch in the stack
     async fn determine_optimal_target_branch(
         &self,
         branch_name: &str,
         stack: &Stack,
-        gitlab_client: &GitLabClient,
+        gitlab_client: &(dyn GitLabApi + Send + Sync),
     ) -> Result<String> {
         let branch = stack
             .branches
@@ -1710,198 +1724,124 @@ impl StackManager {
                 message: format!("Branch '{}' not found in stack", branch_name),
             })?;
 
-        let mut current_parent = branch
-            .parent
-            .as_deref()
-            .unwrap_or(&stack.base_branch)
-            .to_string();
+        // Use parent from stack as fallback
+        let local_parent = branch.parent.as_ref().unwrap_or(&stack.base_branch);
 
-        // Walk up the stack hierarchy to find the best available target
-        loop {
-            // Check if the current parent branch still exists and is available
-            if current_parent == stack.base_branch {
-                // Base branch is always a valid target
-                break;
-            }
-
-            if let Some(parent_branch) = stack.branches.get(&current_parent) {
-                // Check if parent branch has an open MR - if merged, we should target its target
-                if let Some(parent_mr_iid) = parent_branch.mr_iid {
-                    match gitlab_client.get_merge_request(parent_mr_iid).await {
-                        Ok(parent_mr) => {
-                            if parent_mr.state == "merged" {
-                                // Parent is merged, target its target branch
-                                print_info(&format!(
-                                    "Parent branch '{}' is merged, retargeting to '{}'",
-                                    current_parent, parent_mr.target_branch
-                                ));
-                                current_parent = parent_mr.target_branch;
-                                continue;
-                            } else if parent_mr.state == "closed" {
-                                // Parent MR is closed, move up the hierarchy
-                                print_info(&format!(
-                                    "Parent branch '{}' MR is closed, moving up hierarchy",
-                                    current_parent
-                                ));
-                                current_parent = parent_branch
-                                    .parent
-                                    .as_deref()
-                                    .unwrap_or(&stack.base_branch)
-                                    .to_string();
-                                continue;
-                            }
-                            // Parent MR is open, this is a valid target
-                            break;
-                        }
-                        Err(_) => {
-                            // Can't get MR status, assume branch is still valid
-                            print_warning(&format!(
-                                "Unable to check MR status for parent '{}', assuming valid",
-                                current_parent
-                            ));
-                            break;
-                        }
-                    }
+        // If this branch already has an MR, check if its target is still valid
+        if let Some(mr_iid) = branch.mr_iid {
+            if let Ok(mr) = gitlab_client.get_merge_request(mr_iid).await {
+                // If the target branch of the MR is a valid branch in our stack, keep it
+                if stack.branches.contains_key(&mr.target_branch) {
+                    print_info(&format!(
+                        "Keeping existing MR target '{}' for branch '{}'",
+                        mr.target_branch, branch_name
+                    ));
+                    return Ok(mr.target_branch);
                 } else {
-                    // Parent branch exists but has no MR, check if the branch itself still exists
-                    match self.git_repo.run(&[
-                        "rev-parse",
-                        "--verify",
-                        &format!("origin/{}", current_parent),
-                    ]) {
-                        Ok(_) => break, // Branch exists remotely
-                        Err(_) => {
-                            // Branch doesn't exist remotely, move up the hierarchy
-                            print_info(&format!(
-                                "Parent branch '{}' not found remotely, moving up hierarchy",
-                                current_parent
-                            ));
-                            current_parent = parent_branch
-                                .parent
-                                .as_deref()
-                                .unwrap_or(&stack.base_branch)
-                                .to_string();
-                            continue;
-                        }
-                    }
+                    print_warning(&format!(
+                        "MR target '{}' for branch '{}' is no longer in the stack. Detecting new target...",
+                        mr.target_branch, branch_name
+                    ));
                 }
-            } else {
-                // Parent not in stack, assume it's valid (might be base branch or external branch)
-                break;
             }
         }
 
-        Ok(current_parent)
+        // Check siblings to see if we should target one of them
+        let siblings: Vec<_> = stack
+            .branches
+            .values()
+            .filter(|b| b.parent.as_deref() == branch.parent.as_deref())
+            .collect();
+
+        if siblings.len() > 1 {
+            // Find a sibling that is a parent of some other branch
+            for sibling in &siblings {
+                if stack
+                    .branches
+                    .values()
+                    .any(|b| b.parent.as_deref() == Some(sibling.name.as_str()))
+                {
+                    // This sibling is a parent, we should likely target it
+                    // if our commits are based on it
+                    let merge_base = self
+                        .git_repo
+                        .run(&["merge-base", &sibling.name, branch_name])?;
+                    if merge_base.trim() == self.git_repo.get_commit_hash_for_branch(&sibling.name)?
+                    {
+                        print_info(&format!(
+                            "Detected '{}' as a better target than parent for '{}'",
+                            sibling.name, branch_name
+                        ));
+                        return Ok(sibling.name.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(local_parent.clone())
     }
 
     /// Create or update merge request with intelligent target branch selection and store MR IID
     async fn create_or_update_mr_with_smart_targeting_and_store(
         &self,
-        gitlab_client: &GitLabClient,
+        gitlab_client: &(dyn GitLabApi + Send + Sync),
         branch_name: &str,
         branch: &StackBranch,
         stack: &mut Stack,
     ) -> Result<()> {
-        // Determine the optimal target branch
-        let optimal_target = self
+        let target_branch = self
             .determine_optimal_target_branch(branch_name, stack, gitlab_client)
             .await?;
-        let original_parent = branch.parent.as_deref().unwrap_or(&stack.base_branch);
 
-        let title = format!("[Stack: {}] {}", stack.name, branch_name);
-        let description = Some(format!(
-            "Part of stack: {}\n\nBase branch: {}\nOriginal parent: {}\nCurrent target: {}\n\nStack ID: {}",
-            stack.name, stack.base_branch, original_parent, optimal_target, stack.id
+        // Fetch the latest commit message to use as the MR title
+        let commit_message = self
+            .git_repo
+            .run(&["log", "-1", "--pretty=%s", &branch.commit_hash])?;
+        let mr_title = format!("[Stack: {}] {}", stack.name, commit_message.trim());
+
+        let mr_description = Some(format!(
+            "This MR is part of stack '{}'.\n\n**Stack Branches:**\n{}",
+            stack.name,
+            stack.branches.keys().cloned().collect::<Vec<String>>().join("\n")
         ));
 
-        if branch.mr_iid.is_none() {
-            // Create new MR with optimal target
-            let request = CreateMergeRequestRequest {
-                source_branch: branch_name.to_string(),
-                target_branch: optimal_target.clone(),
-                title,
-                description,
-            };
-
-            match gitlab_client.create_merge_request(request).await {
-                Ok(mr) => {
-                    print_success(&format!(
-                        "Created MR !{} for branch {} targeting {}",
-                        mr.iid, branch_name, optimal_target
-                    ));
-                    // Update the stack to store the MR IID
-                    if let Some(stack_branch) = stack.branches.get_mut(branch_name) {
-                        stack_branch.mr_iid = Some(mr.iid);
-                        stack_branch.updated_at = Utc::now();
-                    }
-                    stack.updated_at = Utc::now();
-                }
-                Err(e) => {
-                    print_warning(&format!("Failed to create MR for {}: {}", branch_name, e));
-                }
-            }
+        if let Some(iid) = branch.mr_iid {
+            // Update existing MR
+            print_info(&format!("Updating MR !{} for branch {}", iid, branch_name));
+            gitlab_client
+                .update_merge_request_with_target(
+                    iid,
+                    Some(mr_title),
+                    mr_description,
+                    Some(target_branch.clone()),
+                )
+                .await?;
+            print_success(&format!(
+                "Updated MR !{} with target '{}'",
+                iid, target_branch
+            ));
         } else {
-            // Update existing MR, potentially changing the target
-            let iid = branch.mr_iid.unwrap();
+            // Create new MR
+            print_info(&format!(
+                "Creating MR for branch {} targeting {}",
+                branch_name, target_branch
+            ));
+            let request = CreateMergeRequestRequest {
+                title: mr_title,
+                description: mr_description,
+                source_branch: branch_name.to_string(),
+                target_branch: target_branch.clone(),
+            };
+            let mr = gitlab_client.create_merge_request(request).await?;
+            print_success(&format!(
+                "Created MR !{} for branch {}",
+                mr.iid, branch_name
+            ));
 
-            // First check current MR state to see if target needs updating
-            let current_mr = gitlab_client.get_merge_request(iid).await?;
-            let needs_retarget = current_mr.target_branch != optimal_target;
-
-            if needs_retarget {
-                print_info(&format!(
-                    "Retargeting MR !{} for {} from '{}' to '{}'",
-                    iid, branch_name, current_mr.target_branch, optimal_target
-                ));
-
-                match gitlab_client
-                    .update_merge_request_with_target(
-                        iid,
-                        Some(title),
-                        description,
-                        Some(optimal_target.clone()),
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        print_success(&format!(
-                            "Retargeted MR !{} for branch {} to {}",
-                            iid, branch_name, optimal_target
-                        ));
-                        // Update the stack to reflect the change
-                        if let Some(stack_branch) = stack.branches.get_mut(branch_name) {
-                            stack_branch.updated_at = Utc::now();
-                        }
-                        stack.updated_at = Utc::now();
-                    }
-                    Err(e) => {
-                        print_warning(&format!(
-                            "Failed to retarget MR !{} for {}: {}",
-                            iid, branch_name, e
-                        ));
-                    }
-                }
-            } else {
-                // Just update title and description
-                match gitlab_client
-                    .update_merge_request(iid, Some(title), description)
-                    .await
-                {
-                    Ok(_) => {
-                        print_success(&format!("Updated MR !{} for branch {}", iid, branch_name));
-                        // Update the stack to reflect the change
-                        if let Some(stack_branch) = stack.branches.get_mut(branch_name) {
-                            stack_branch.updated_at = Utc::now();
-                        }
-                        stack.updated_at = Utc::now();
-                    }
-                    Err(e) => {
-                        print_warning(&format!(
-                            "Failed to update MR !{} for {}: {}",
-                            iid, branch_name, e
-                        ));
-                    }
-                }
+            // Store new IID in the stack
+            if let Some(b) = stack.branches.get_mut(branch_name) {
+                b.mr_iid = Some(mr.iid);
+                b.updated_at = Utc::now();
             }
         }
 
