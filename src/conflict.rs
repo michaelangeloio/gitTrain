@@ -69,28 +69,21 @@ impl ConflictResolver {
         }
     }
 
-
     /// Check the current git state for conflicts
     pub fn get_git_state(&self) -> Result<GitState> {
         let git_dir = &self.git_dir;
 
         // First check for ongoing operations, then conflicts within those operations
-        if git_dir.join("REBASE_HEAD").exists() {
-            if self.is_rebase_actually_active()? {
-                return Ok(GitState::Rebasing);
-            }
+        if git_dir.join("REBASE_HEAD").exists() && self.is_rebase_actually_active()? {
+            return Ok(GitState::Rebasing);
         }
 
-        if git_dir.join("MERGE_HEAD").exists() {
-            if self.is_merge_actually_active()? {
-                return Ok(GitState::Merging);
-            }
+        if git_dir.join("MERGE_HEAD").exists() && self.is_merge_actually_active()? {
+            return Ok(GitState::Merging);
         }
 
-        if git_dir.join("CHERRY_PICK_HEAD").exists() {
-            if self.is_cherry_pick_actually_active()? {
-                return Ok(GitState::CherryPicking);
-            }
+        if git_dir.join("CHERRY_PICK_HEAD").exists() && self.is_cherry_pick_actually_active()? {
+            return Ok(GitState::CherryPicking);
         }
 
         // If no ongoing operations, check for conflicts in working directory
@@ -118,9 +111,7 @@ impl ConflictResolver {
     fn is_rebase_actually_active(&self) -> Result<bool> {
         // Try to get rebase info - this will fail if no rebase is actually in progress
         match self.git_repo.run(&["rebase", "--show-current-patch"]) {
-            Ok(_output) => {
-                Ok(true)
-            }
+            Ok(_output) => Ok(true),
             Err(_e) => {
                 // Also check for rebase directories that would exist during an active rebase
                 let git_dir = &self.git_dir;
@@ -146,7 +137,8 @@ impl ConflictResolver {
     }
 
     /// Clean up stale rebase state using `git rebase --abort`
-    fn cleanup_stale_rebase_files(&self) -> Result<()> {
+    #[cfg(test)]
+    pub fn cleanup_stale_rebase_files(&self) -> Result<()> {
         match self.git_repo.run(&["rebase", "--abort"]) {
             Ok(_) => ui::print_info("Ran 'git rebase --abort' to clean stale state"),
             Err(e) => ui::print_warning(&format!(
@@ -156,7 +148,6 @@ impl ConflictResolver {
         }
         Ok(())
     }
-
 
     /// Detect and analyze conflicts in the repository
     pub fn detect_conflicts(&self) -> Result<Option<ConflictInfo>> {
@@ -190,14 +181,16 @@ impl ConflictResolver {
         // In test environment, don't try to prompt the user - just return an error
         let is_cfg_test = cfg!(test);
         let has_test_env = std::env::var("RUST_TEST_TIME_UNIT").is_ok();
-        let has_cargo_test = std::env::var("CARGO_PKG_NAME").is_ok() && 
-                           (std::thread::current().name().unwrap_or("").contains("test") ||
-                            std::env::args().any(|arg| arg.contains("test")));
-        
+        let has_cargo_test = std::env::var("CARGO_PKG_NAME").is_ok()
+            && (std::thread::current().name().unwrap_or("").contains("test")
+                || std::env::args().any(|arg| arg.contains("test")));
+
         if is_cfg_test || has_test_env || has_cargo_test {
             ui::print_warning("Running in test environment - cannot prompt for user input");
             return Err(TrainError::InvalidState {
-                message: "Manual conflict resolution required but running in non-interactive environment".to_string(),
+                message:
+                    "Manual conflict resolution required but running in non-interactive environment"
+                        .to_string(),
             }
             .into());
         }
@@ -251,10 +244,11 @@ impl ConflictResolver {
                 conflict_file.path, editor_config.default_editor
             ));
 
-            match self
-                .editor_launcher
-                .launch(&editor_config.default_editor, &editor_config.editor_args, &conflict_file.path)
-            {
+            match self.editor_launcher.launch(
+                &editor_config.default_editor,
+                &editor_config.editor_args,
+                &conflict_file.path,
+            ) {
                 Ok(status) => {
                     if !status.success() {
                         ui::print_warning(&format!(
@@ -306,7 +300,11 @@ impl ConflictResolver {
     }
 
     /// Verify that all conflicts have been resolved
-    pub async fn verify_conflicts_resolved(&self, original: &ConflictInfo, initial_state: GitState) -> Result<()> {
+    pub async fn verify_conflicts_resolved(
+        &self,
+        original: &ConflictInfo,
+        initial_state: GitState,
+    ) -> Result<()> {
         loop {
             let current_conflicts = self.detect_conflicts()?;
             if let Some(conflicts) = current_conflicts {
@@ -443,7 +441,10 @@ mod tests {
 
     fn init_repo() -> Result<(tempfile::TempDir, GitRepository, PathBuf)> {
         let tmp = tempfile::tempdir()?;
-        Command::new("git").arg("init").current_dir(tmp.path()).output()?;
+        Command::new("git")
+            .arg("init")
+            .current_dir(tmp.path())
+            .output()?;
         Command::new("git")
             .args(["config", "user.email", "test@example.com"])
             .current_dir(tmp.path())
@@ -496,7 +497,9 @@ mod tests {
             }],
         };
 
-        resolver.verify_conflicts_resolved(&info, GitState::Clean).await?;
+        resolver
+            .verify_conflicts_resolved(&info, GitState::Clean)
+            .await?;
 
         let out = Command::new("git")
             .args(["diff", "--name-only", "--cached"])

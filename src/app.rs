@@ -45,7 +45,7 @@ impl AppContext {
 
     /// Get a `StackManager` instance.
     async fn get_stack_manager(&self) -> Result<StackManager> {
-        StackManager::new_with_config(self.config.clone()).await
+        StackManager::new_with_config(self.config.clone(), None, None).await
     }
 
     /// Handle stack-related commands.
@@ -56,7 +56,7 @@ impl AppContext {
     ) -> Result<()> {
         match command {
             Commands::Create { name } => stack_manager.create_stack(&name).await,
-            Commands::Save { message } => stack_manager.save_changes(&message).await,
+            Commands::Commit { message } => stack_manager.commit_changes(&message).await,
             Commands::Amend { message } => stack_manager.amend_changes(message.as_deref()).await,
             Commands::Add { parent } => stack_manager.add_branch_to_stack(parent.as_deref()).await,
             Commands::Status => stack_manager.show_status().await,

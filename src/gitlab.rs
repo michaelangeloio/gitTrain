@@ -74,7 +74,6 @@ pub trait GitLabApi: Send + Sync {
         target_branch: Option<String>,
     ) -> Result<MergeRequest>;
     async fn get_merge_request(&self, iid: u64) -> Result<MergeRequest>;
-    fn get_project_details(&self) -> &RwLock<Option<GitLabProject>>;
 }
 
 pub struct GitLabClient {
@@ -471,9 +470,5 @@ impl GitLabApi for GitLabClient {
             }
             .into())
         }
-    }
-
-    fn get_project_details(&self) -> &RwLock<Option<GitLabProject>> {
-        &self.project_details
     }
 }

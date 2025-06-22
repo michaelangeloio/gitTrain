@@ -10,11 +10,11 @@ use gittrain::stack::StackManager;
 use std::collections::HashMap;
 use std::fs;
 
+use gittrain::config::AutoResolveStrategy;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tokio::sync::RwLock;
-use gittrain::config::AutoResolveStrategy;
 
 // A helper struct for managing a temporary git repository for tests
 struct TestRepo {
@@ -29,7 +29,12 @@ impl TestRepo {
         let local_tmp = tempfile::tempdir()?;
         let local_path = local_tmp.path();
 
-        Command::new("git").arg("init").arg("-b").arg("main").current_dir(local_path).output()?;
+        Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .current_dir(local_path)
+            .output()?;
         Command::new("git")
             .args(["config", "user.email", "test@example.com"])
             .current_dir(local_path)
@@ -45,14 +50,21 @@ impl TestRepo {
         // Setup the "remote" repository
         let remote_tmp = tempfile::tempdir()?;
         let remote_path = remote_tmp.path();
-        Command::new("git").arg("init").arg("--bare").current_dir(remote_path).output()?;
-        
+        Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .current_dir(remote_path)
+            .output()?;
+
         // Add the remote to the local repo
         repo.run(&["remote", "add", "origin", remote_path.to_str().unwrap()])?;
         repo.run(&["push", "-u", "origin", "main"])?;
 
-
-        Ok(Self { dir: local_tmp, remote_dir: remote_tmp, repo })
+        Ok(Self {
+            dir: local_tmp,
+            remote_dir: remote_tmp,
+            repo,
+        })
     }
 
     fn path(&self) -> &std::path::Path {
@@ -150,7 +162,10 @@ impl GitLabApi for MockGitLab {
             web_url: format!("{}/merge_requests/{}", self.project.web_url, new_iid),
         };
 
-        self.merge_requests.lock().unwrap().insert(new_iid, mr.clone());
+        self.merge_requests
+            .lock()
+            .unwrap()
+            .insert(new_iid, mr.clone());
         Ok(mr)
     }
 
@@ -172,7 +187,7 @@ impl GitLabApi for MockGitLab {
 
         Ok(mr.clone())
     }
-    
+
     async fn update_merge_request_with_target(
         &self,
         iid: u64,
@@ -200,18 +215,17 @@ impl GitLabApi for MockGitLab {
         let mrs = self.merge_requests.lock().unwrap();
         Ok(mrs.get(&iid).cloned().unwrap())
     }
-
-    fn get_project_details(&self) -> &RwLock<Option<GitLabProject>> {
-        &self.project_details
-    }
 }
-
 
 #[cfg(test)]
 mod integration_tests {
     use super::*;
 
-    async fn setup() -> Result<(TestRepo, StackManager, Arc<Mutex<HashMap<u64, MergeRequest>>>)> {
+    async fn setup() -> Result<(
+        TestRepo,
+        StackManager,
+        Arc<Mutex<HashMap<u64, MergeRequest>>>,
+    )> {
         let test_repo = TestRepo::new()?;
         let mut config = TrainConfig::default();
         config.conflict_resolution.auto_force_push_after_rebase = true;
@@ -221,9 +235,13 @@ mod integration_tests {
         let mock_gitlab = MockGitLab::new();
         let mrs = mock_gitlab.merge_requests.clone();
 
-        let mut stack_manager =
-            StackManager::new_with_git_repo(config.clone(), test_repo.git_repo().clone()).await?;
-        stack_manager.set_gitlab_client(Box::new(mock_gitlab));
+        let gitlab_client = Some(Box::new(mock_gitlab) as Box<dyn GitLabApi + Send + Sync>);
+        let stack_manager = StackManager::new_with_config(
+            config.clone(),
+            Some(test_repo.git_repo().clone()),
+            gitlab_client,
+        )
+        .await?;
 
         Ok((test_repo, stack_manager, mrs))
     }
@@ -278,7 +296,9 @@ mod integration_tests {
         // 3. Go back to feature-1 and amend it. This will also rebase feature-2.
         test_repo.checkout("feature-1")?;
         test_repo.create_file("file1.txt", "new-content1")?;
-        stack_manager.amend_changes(Some("feat: update file1")).await?;
+        stack_manager
+            .amend_changes(Some("feat: update file1"))
+            .await?;
 
         // 4. Push again to update the remote MRs
         stack_manager.push_stack().await?;
@@ -296,9 +316,15 @@ mod integration_tests {
 
         let mrs_after = mrs.lock().unwrap();
         assert_eq!(mrs_after.len(), 2);
-        
-        let mr_feature1 = mrs_after.values().find(|mr| mr.source_branch == "feature-1").unwrap();
-        let mr_feature2 = mrs_after.values().find(|mr| mr.source_branch == "feature-2").unwrap();
+
+        let mr_feature1 = mrs_after
+            .values()
+            .find(|mr| mr.source_branch == "feature-1")
+            .unwrap();
+        let mr_feature2 = mrs_after
+            .values()
+            .find(|mr| mr.source_branch == "feature-2")
+            .unwrap();
 
         assert_eq!(mr_feature1.title, "[Stack: my-stack] feat: update file1");
         assert_eq!(mr_feature2.title, "[Stack: my-stack] feat: add file2");
@@ -334,12 +360,17 @@ mod integration_tests {
         // 3. Stay on feature-3 (the latest branch) and edit a file from feature-1
         // This simulates the common workflow where you're working on the latest branch
         // but realize you need to fix something from an earlier branch
-        test_repo.create_file("file1.txt", "updated content from feature-1 (edited from feature-3)")?;
+        test_repo.create_file(
+            "file1.txt",
+            "updated content from feature-1 (edited from feature-3)",
+        )?;
         // Don't commit yet - let amend_changes handle it
-        
+
         // 4. Use existing functionality to sync the stack - it should automatically detect
         // that we've edited files from an earlier branch and handle it properly
-        stack_manager.amend_changes(Some("fix: update file1 from earlier branch")).await?;
+        stack_manager
+            .amend_changes(Some("fix: update file1 from earlier branch"))
+            .await?;
 
         // 5. Verify that:
         // - feature-1 has the updated file1.txt content
@@ -349,18 +380,25 @@ mod integration_tests {
         // Check feature-1 has the updated content
         test_repo.checkout("feature-1")?;
         let file1_content = std::fs::read_to_string(test_repo.path().join("file1.txt"))?;
-        assert_eq!(file1_content, "updated content from feature-1 (edited from feature-3)");
+        assert_eq!(
+            file1_content,
+            "updated content from feature-1 (edited from feature-3)"
+        );
 
         // Check that feature-2 was rebased (parent should be updated feature-1)
         test_repo.checkout("feature-2")?;
         let feature2_parent = test_repo.git_repo().run(&["rev-parse", "feature-2^"])?;
-        let feature1_hash = test_repo.git_repo().get_commit_hash_for_branch("feature-1")?;
+        let feature1_hash = test_repo
+            .git_repo()
+            .get_commit_hash_for_branch("feature-1")?;
         assert_eq!(feature2_parent.trim(), feature1_hash.trim());
 
         // Check that feature-3 was rebased (parent should be updated feature-2)
         test_repo.checkout("feature-3")?;
         let feature3_parent = test_repo.git_repo().run(&["rev-parse", "feature-3^"])?;
-        let feature2_hash = test_repo.git_repo().get_commit_hash_for_branch("feature-2")?;
+        let feature2_hash = test_repo
+            .git_repo()
+            .get_commit_hash_for_branch("feature-2")?;
         assert_eq!(feature3_parent.trim(), feature2_hash.trim());
 
         // Verify all files are present in feature-3
@@ -369,8 +407,12 @@ mod integration_tests {
         assert!(test_repo.path().join("file3.txt").exists());
 
         // Check that file1.txt has the updated content in feature-3
-        let file1_content_in_feature3 = std::fs::read_to_string(test_repo.path().join("file1.txt"))?;
-        assert_eq!(file1_content_in_feature3, "updated content from feature-1 (edited from feature-3)");
+        let file1_content_in_feature3 =
+            std::fs::read_to_string(test_repo.path().join("file1.txt"))?;
+        assert_eq!(
+            file1_content_in_feature3,
+            "updated content from feature-1 (edited from feature-3)"
+        );
 
         // 6. Push the updated stack
         stack_manager.push_stack().await?;
@@ -394,9 +436,13 @@ mod integration_tests {
         let mock_gitlab = MockGitLab::new();
         let _mrs = mock_gitlab.merge_requests.clone();
 
-        let mut stack_manager =
-            StackManager::new_with_git_repo(config, test_repo.git_repo().clone()).await?;
-        stack_manager.set_gitlab_client(Box::new(mock_gitlab));
+        let gitlab_client = Some(Box::new(mock_gitlab) as Box<dyn GitLabApi + Send + Sync>);
+        let mut stack_manager = StackManager::new_with_config(
+            config,
+            Some(test_repo.git_repo().clone()),
+            gitlab_client,
+        )
+        .await?;
 
         // 1. Setup a stack
         test_repo.create_branch("feature-1")?;
@@ -433,4 +479,4 @@ mod integration_tests {
 
         Ok(())
     }
-} 
+}

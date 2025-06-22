@@ -7,4 +7,4 @@ pub mod git;
 pub mod gitlab;
 pub mod stack;
 pub mod ui;
-pub mod utils; 
+pub mod utils;

@@ -16,7 +16,7 @@ pub enum Commands {
     },
 
     /// Add current changes to the stack
-    Save {
+    Commit {
         /// Commit message
         #[arg(short, long)]
         message: String,
