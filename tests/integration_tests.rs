@@ -307,6 +307,81 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_edit_earlier_branch_from_latest() -> Result<()> {
+        let (test_repo, mut stack_manager, mrs) = setup().await?;
+
+        // 1. Create a stack of 3 branches with different files
+        test_repo.create_branch("feature-1")?;
+        test_repo.create_file("file1.txt", "original content from feature-1")?;
+        test_repo.commit("feat: add file1 in feature-1")?;
+        stack_manager.create_stack("my-stack").await?;
+
+        test_repo.create_branch("feature-2")?;
+        test_repo.create_file("file2.txt", "content from feature-2")?;
+        test_repo.commit("feat: add file2 in feature-2")?;
+        stack_manager.add_branch_to_stack(Some("feature-1")).await?;
+
+        test_repo.create_branch("feature-3")?;
+        test_repo.create_file("file3.txt", "content from feature-3")?;
+        test_repo.commit("feat: add file3 in feature-3")?;
+        stack_manager.add_branch_to_stack(Some("feature-2")).await?;
+
+        // 2. Push the stack to create MRs
+        stack_manager.push_stack().await?;
+        assert_eq!(mrs.lock().unwrap().len(), 3);
+
+        // 3. Stay on feature-3 (the latest branch) and edit a file from feature-1
+        // This simulates the common workflow where you're working on the latest branch
+        // but realize you need to fix something from an earlier branch
+        test_repo.create_file("file1.txt", "updated content from feature-1 (edited from feature-3)")?;
+        // Don't commit yet - let amend_changes handle it
+        
+        // 4. Use existing functionality to sync the stack - it should automatically detect
+        // that we've edited files from an earlier branch and handle it properly
+        stack_manager.amend_changes(Some("fix: update file1 from earlier branch")).await?;
+
+        // 5. Verify that:
+        // - feature-1 has the updated file1.txt content
+        // - feature-2 and feature-3 were rebased onto the updated feature-1
+        // - The stack hierarchy is maintained
+
+        // Check feature-1 has the updated content
+        test_repo.checkout("feature-1")?;
+        let file1_content = std::fs::read_to_string(test_repo.path().join("file1.txt"))?;
+        assert_eq!(file1_content, "updated content from feature-1 (edited from feature-3)");
+
+        // Check that feature-2 was rebased (parent should be updated feature-1)
+        test_repo.checkout("feature-2")?;
+        let feature2_parent = test_repo.git_repo().run(&["rev-parse", "feature-2^"])?;
+        let feature1_hash = test_repo.git_repo().get_commit_hash_for_branch("feature-1")?;
+        assert_eq!(feature2_parent.trim(), feature1_hash.trim());
+
+        // Check that feature-3 was rebased (parent should be updated feature-2)
+        test_repo.checkout("feature-3")?;
+        let feature3_parent = test_repo.git_repo().run(&["rev-parse", "feature-3^"])?;
+        let feature2_hash = test_repo.git_repo().get_commit_hash_for_branch("feature-2")?;
+        assert_eq!(feature3_parent.trim(), feature2_hash.trim());
+
+        // Verify all files are present in feature-3
+        assert!(test_repo.path().join("file1.txt").exists());
+        assert!(test_repo.path().join("file2.txt").exists());
+        assert!(test_repo.path().join("file3.txt").exists());
+
+        // Check that file1.txt has the updated content in feature-3
+        let file1_content_in_feature3 = std::fs::read_to_string(test_repo.path().join("file1.txt"))?;
+        assert_eq!(file1_content_in_feature3, "updated content from feature-1 (edited from feature-3)");
+
+        // 6. Push the updated stack
+        stack_manager.push_stack().await?;
+
+        // Verify MRs are updated
+        let mrs_after = mrs.lock().unwrap();
+        assert_eq!(mrs_after.len(), 3);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_conflict_detection() -> Result<()> {
         // Custom setup for this test to control config
         let test_repo = TestRepo::new()?;

@@ -84,6 +84,34 @@ impl StackManager {
         &self.conflict_resolver
     }
 
+    /// Create a unique backup name that doesn't conflict with existing branches
+    fn create_unique_backup_name(&self, prefix: &str) -> Result<String> {
+        let base_name = create_backup_name(prefix);
+        
+        // Check if this backup name already exists
+        match self.git_repo.run(&["rev-parse", "--verify", &base_name]) {
+            Ok(_) => {
+                // Backup exists, add a counter
+                for i in 1..=100 {
+                    let unique_name = format!("{}_{}", base_name, i);
+                    if self.git_repo.run(&["rev-parse", "--verify", &unique_name]).is_err() {
+                        return Ok(unique_name);
+                    }
+                }
+                // If we can't find a unique name after 100 tries, just use the original with a UUID
+                let uuid = std::process::Command::new("uuidgen")
+                    .output()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                    .unwrap_or_else(|_| format!("{}", std::process::id()));
+                Ok(format!("{}_{}", base_name, uuid))
+            }
+            Err(_) => {
+                // Backup doesn't exist, we can use the base name
+                Ok(base_name)
+            }
+        }
+    }
+
     /// Smart rebase that handles conflicts automatically when possible
     async fn smart_rebase(&self, branch: &str, onto: &str) -> Result<()> {
         // First check if we're already in a conflict state
@@ -99,7 +127,7 @@ impl StackManager {
 
         // Create backup if configured
         if self.config.conflict_resolution.backup_on_conflict {
-            let backup_branch = create_backup_name(branch);
+            let backup_branch = self.create_unique_backup_name(branch)?;
             self.git_repo.run(&["branch", &backup_branch])?;
             print_info(&format!("Created backup branch: {}", backup_branch));
         }
@@ -345,8 +373,344 @@ impl StackManager {
             .into());
         }
 
+        // Check if there are any files to amend
+        let staged_output = self.git_repo.run(&["diff", "--cached", "--name-only"])?;
+        let modified_files: Vec<String> = staged_output
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // If no staged changes, check if we're just amending the message
+        if modified_files.is_empty() && new_message.is_none() {
+            // Check if there are unstaged changes to stage
+            let unstaged_output = self.git_repo.run(&["diff", "--name-only"])?;
+            if !unstaged_output.trim().is_empty() {
+                // Stage all unstaged changes
+                self.git_repo.run(&["add", "."])?;
+                let staged_output = self.git_repo.run(&["diff", "--cached", "--name-only"])?;
+                let new_modified_files: Vec<String> = staged_output
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                
+                if !new_modified_files.is_empty() {
+                    // Detect and handle files from earlier branches
+                    let files_to_propagate = self.detect_files_from_earlier_branches(&stack, &current_branch, &new_modified_files)?;
+                    
+                    if !files_to_propagate.is_empty() {
+                        return self.handle_earlier_branch_propagation(&stack, &current_branch, files_to_propagate, new_message).await;
+                    }
+                }
+            }
+        } else if !modified_files.is_empty() {
+            // Detect if any of the modified files originally came from earlier branches
+            let files_to_propagate = self.detect_files_from_earlier_branches(&stack, &current_branch, &modified_files)?;
+            
+            if !files_to_propagate.is_empty() {
+                return self.handle_earlier_branch_propagation(&stack, &current_branch, files_to_propagate, new_message).await;
+            }
+        }
+
+        // Standard amend logic for files that don't need earlier branch propagation
+        self.perform_standard_amend(&stack, &current_branch, new_message).await
+    }
+
+    /// Detect which files in the current changes originally came from earlier branches in the stack
+    fn detect_files_from_earlier_branches(
+        &self, 
+        stack: &Stack, 
+        current_branch: &str, 
+        modified_files: &[String]
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let mut files_to_propagate: HashMap<String, Vec<String>> = HashMap::new();
+        
+        // Get all ancestor branches (earlier branches in the stack)
+        let ancestors = self.get_ancestor_branches(stack, current_branch);
+        print_info(&format!("DEBUG: Found {} ancestor branches: {:?}", ancestors.len(), ancestors));
+        
+        for ancestor in ancestors {
+            // Get files that were introduced or modified in this ancestor branch
+            let ancestor_files = self.get_files_from_branch(stack, &ancestor)?;
+            
+            // Check which modified files belong to this ancestor
+            let matching_files: Vec<String> = modified_files
+                .iter()
+                .filter(|file| ancestor_files.contains(*file))
+                .cloned()
+                .collect();
+            
+            if !matching_files.is_empty() {
+                files_to_propagate.insert(ancestor, matching_files);
+            }
+        }
+        
+        Ok(files_to_propagate)
+    }
+
+    /// Get all ancestor branches (earlier in the stack) for a given branch
+    fn get_ancestor_branches(&self, stack: &Stack, branch: &str) -> Vec<String> {
+        let mut ancestors = Vec::new();
+        let mut current = branch;
+        
+        // Walk up the parent chain
+        while let Some(stack_branch) = stack.branches.get(current) {
+            if let Some(parent) = &stack_branch.parent {
+                if parent != &stack.base_branch {
+                    ancestors.push(parent.clone());
+                }
+                current = parent;
+            } else {
+                break;
+            }
+        }
+        
+        ancestors
+    }
+
+    /// Get files that were introduced or modified in a specific branch
+    fn get_files_from_branch(&self, stack: &Stack, branch_name: &str) -> Result<Vec<String>> {
+        let branch = stack.branches.get(branch_name).ok_or_else(|| TrainError::StackError {
+            message: format!("Branch '{}' not found in stack", branch_name),
+        })?;
+        
+        let parent = branch.parent.as_ref().unwrap_or(&stack.base_branch);
+        
+        // Get files that were introduced or modified in this branch
+        let files_output = self.git_repo.run(&[
+            "diff-tree", "--no-commit-id", "--name-only", "-r",
+            &format!("{}..{}", parent, branch_name)
+        ])?;
+        
+        Ok(files_output
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
+    }
+
+    /// Handle propagation of changes back to earlier branches
+    async fn handle_earlier_branch_propagation(
+        &mut self,
+        stack: &Stack,
+        current_branch: &str,
+        files_to_propagate: HashMap<String, Vec<String>>,
+        new_message: Option<&str>,
+    ) -> Result<()> {
+        print_info("Detected files from earlier branches in the stack. Propagating changes...");
+        
+        // Create a backup of the current branch
+        let backup_branch = self.create_unique_backup_name(current_branch)?;
+        self.git_repo.run(&["branch", &backup_branch])?;
+        print_info(&format!("Created backup branch: {}", backup_branch));
+
+        // Get the commit message to use
+        let commit_message = if let Some(msg) = new_message {
+            msg.to_string()
+        } else {
+            self.git_repo.run(&["log", "-1", "--pretty=%s"])?
+        };
+
+        let mut updated_stack = stack.clone();
+        
+        // Collect file contents before switching branches
+        let mut all_file_contents: HashMap<String, HashMap<String, String>> = HashMap::new();
+        
+        for (target_branch, files) in &files_to_propagate {
+            let mut file_contents = HashMap::new();
+            for file in files {
+                // Read the file content from the current branch
+                match std::fs::read_to_string(
+                    format!("{}/{}", 
+                        self.git_repo.run(&["rev-parse", "--show-toplevel"])?.trim(), 
+                        file
+                    )
+                ) {
+                    Ok(content) => {
+                        file_contents.insert(file.clone(), content);
+                    }
+                    Err(e) => {
+                        print_warning(&format!("Could not read file '{}': {}", file, e));
+                    }
+                }
+            }
+            all_file_contents.insert(target_branch.clone(), file_contents);
+        }
+        
+        // Sort branches by their depth (closer to base branch first)
+        let mut branches_to_update: Vec<(&String, &Vec<String>)> = files_to_propagate.iter().collect();
+        branches_to_update.sort_by(|a, b| {
+            let depth_a = self.get_branch_depth_in_stack(stack, a.0);
+            let depth_b = self.get_branch_depth_in_stack(stack, b.0);
+            depth_a.cmp(&depth_b)
+        });
+
+        // Apply changes to each earlier branch
+        for (target_branch, files) in branches_to_update {
+            print_info(&format!("Applying changes to earlier branch: {}", target_branch));
+            
+            // Switch to the target branch
+            self.git_repo.run(&["checkout", target_branch])?;
+            
+            // Apply the file changes using saved content
+            if let Some(file_contents) = all_file_contents.get(target_branch) {
+                for file in files {
+                    if let Some(content) = file_contents.get(file) {
+                        // Write the content to the file in the target branch
+                        let target_file_path = format!("{}/{}", 
+                            self.git_repo.run(&["rev-parse", "--show-toplevel"])?.trim(), 
+                            file
+                        );
+                        std::fs::write(&target_file_path, content)?;
+                        
+                        // Stage the file
+                        self.git_repo.run(&["add", file])?;
+                    }
+                }
+            }
+            
+            // Commit the changes
+            let propagated_message = format!("propagate: {} (from {})", commit_message.trim(), current_branch);
+            self.git_repo.run(&["commit", "-m", &propagated_message])?;
+            
+            // Update the stack state
+            if let Some(branch) = updated_stack.branches.get_mut(target_branch) {
+                branch.commit_hash = self.git_repo.get_commit_hash_for_branch(target_branch)?;
+                branch.updated_at = Utc::now();
+            }
+            
+            print_success(&format!("Applied changes to '{}' with message: {}", target_branch, propagated_message));
+        }
+
+        // Return to current branch and remove the propagated changes
+        self.git_repo.run(&["checkout", current_branch])?;
+        
+        // Remove the propagated files from the current branch's staged changes
+        let all_propagated_files: Vec<String> = files_to_propagate
+            .values()
+            .flat_map(|files| files.iter().cloned())
+            .collect();
+        
+        for file in &all_propagated_files {
+            // Reset the file to its state before our changes
+            if let Ok(content) = self.git_repo.run(&["show", &format!("HEAD:{}", file)]) {
+                let file_path = self.git_repo.run(&["rev-parse", "--show-toplevel"])? + "/" + file;
+                std::fs::write(file_path.trim(), content)?;
+            }
+        }
+        
+        // Re-stage all files and check if there are any remaining changes
+        self.git_repo.run(&["add", "."])?;
+        let remaining_staged = self.git_repo.run(&["diff", "--cached", "--name-only"])?;
+        
+        if !remaining_staged.trim().is_empty() {
+            // There are still changes to commit on the current branch
+            let remaining_message = format!("Remove propagated changes (was: {})", commit_message.trim());
+            self.git_repo.run(&["commit", "-m", &remaining_message])?;
+            print_info(&format!("Cleaned up propagated changes from '{}'", current_branch));
+        } else {
+            // No remaining changes, just update the commit message if needed
+            if let Some(msg) = new_message {
+                self.git_repo.run(&["commit", "--amend", "-m", msg])?;
+                print_info(&format!("Updated commit message to: {}", msg));
+            }
+        }
+
+        // Update current branch in stack
+        if let Some(branch) = updated_stack.branches.get_mut(current_branch) {
+            branch.commit_hash = self.get_current_commit_hash()?;
+            branch.updated_at = Utc::now();
+        }
+
+        // Rebase all branches that are downstream from the earliest modified branch
+        let earliest_branch = files_to_propagate.keys().min_by(|a, b| {
+            let depth_a = self.get_branch_depth_in_stack(stack, a);
+            let depth_b = self.get_branch_depth_in_stack(stack, b);
+            depth_a.cmp(&depth_b)
+        });
+
+        if let Some(earliest) = earliest_branch {
+            print_info("Rebasing downstream branches...");
+            self.rebase_downstream_branches_from(&mut updated_stack, earliest).await?;
+        }
+
+        // Save the updated stack
+        self.stack_state.save_stack(&updated_stack)?;
+        self.current_stack = Some(updated_stack);
+        
+        print_success("Successfully propagated changes to earlier branches and rebased downstream branches");
+        
+        Ok(())
+    }
+
+    /// Get the depth of a branch in the stack hierarchy
+    fn get_branch_depth_in_stack(&self, stack: &Stack, branch_name: &str) -> usize {
+        let mut depth = 0;
+        let mut current = branch_name;
+        
+        while let Some(branch) = stack.branches.get(current) {
+            if let Some(parent) = &branch.parent {
+                if parent == &stack.base_branch {
+                    return depth;
+                }
+                current = parent;
+                depth += 1;
+            } else {
+                break;
+            }
+        }
+        
+        depth
+    }
+
+    /// Rebase all branches downstream from a given branch
+    async fn rebase_downstream_branches_from(&self, stack: &mut Stack, from_branch: &str) -> Result<()> {
+        let hierarchy = self.build_branch_hierarchy(stack);
+        
+        // Find all branches that need to be rebased (downstream from the from_branch)
+        let mut branches_to_rebase = Vec::new();
+        self.collect_downstream_branches(&hierarchy, from_branch, &mut branches_to_rebase);
+
+        // Sort to ensure we rebase in the correct order (parents before children)
+        branches_to_rebase.sort_by(|a, b| {
+            let a_depth = self.get_branch_depth_in_stack(stack, a);
+            let b_depth = self.get_branch_depth_in_stack(stack, b);
+            a_depth.cmp(&b_depth)
+        });
+
+        for branch_name in branches_to_rebase {
+            if let Some(branch) = stack.branches.get(&branch_name) {
+                if let Some(parent) = &branch.parent {
+                    print_info(&format!("Rebasing '{}' onto '{}'", branch_name, parent));
+                    self.smart_rebase(&branch_name, parent).await?;
+                    
+                    // Update commit hash in stack
+                    if let Some(branch_mut) = stack.branches.get_mut(&branch_name) {
+                        branch_mut.commit_hash = self.git_repo.get_commit_hash_for_branch(&branch_name)?;
+                        branch_mut.updated_at = Utc::now();
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Collect all downstream branches recursively
+    fn collect_downstream_branches(&self, hierarchy: &HashMap<String, Vec<String>>, branch: &str, result: &mut Vec<String>) {
+        if let Some(children) = hierarchy.get(branch) {
+            for child in children {
+                result.push(child.clone());
+                self.collect_downstream_branches(hierarchy, child, result);
+            }
+        }
+    }
+
+    /// Perform standard amend operation for files that don't need earlier branch propagation
+    async fn perform_standard_amend(&mut self, stack: &Stack, current_branch: &str, new_message: Option<&str>) -> Result<()> {
         // Create a backup before making changes
-        let backup_branch = create_backup_name(&current_branch);
+        let backup_branch = self.create_unique_backup_name(current_branch)?;
         self.git_repo.run(&["branch", &backup_branch])?;
         print_info(&format!("Created backup branch: {}", backup_branch));
 
@@ -375,7 +739,7 @@ impl StackManager {
 
         // Update the stack state
         let mut updated_stack = stack.clone();
-        if let Some(branch) = updated_stack.branches.get_mut(&current_branch) {
+        if let Some(branch) = updated_stack.branches.get_mut(current_branch) {
             branch.commit_hash = new_commit_hash;
             branch.updated_at = Utc::now();
         }
@@ -383,7 +747,7 @@ impl StackManager {
 
         // Propagate changes to dependent branches (resync downstream)
         print_info("Resyncing downstream branches...");
-        self.propagate_changes(&mut updated_stack, &current_branch)
+        self.propagate_changes(&mut updated_stack, current_branch)
             .await?;
 
         // Save the updated stack
