@@ -9,7 +9,8 @@ use crate::config::TrainConfig;
 use crate::conflict::{ConflictResolver, GitState};
 use crate::errors::TrainError;
 use crate::git::GitRepository;
-use crate::gitlab::api::{CreateMergeRequestRequest, GitLabApi, GitLabClient};
+use crate::gitlab::api::{CreateMergeRequestRequest, GitLabApi, GitLabClient, MergeRequest};
+use crate::gitlab::markdown;
 use crate::stack::state::StackState;
 use crate::stack::types::{Stack, StackBranch};
 use crate::ui::{
@@ -17,6 +18,7 @@ use crate::ui::{
     print_train_header, print_warning, MrStatusInfo,
 };
 use crate::utils::{create_backup_name, sanitize_branch_name};
+use futures::future;
 
 pub struct StackManager {
     stack_state: StackState,
@@ -1490,6 +1492,8 @@ impl StackManager {
         self.process_all_branches_for_mrs(&mut stack, "Updated merge request for")
             .await;
 
+        self.update_all_mr_descriptions(&stack).await;
+
         // Save the updated stack with MR IIDs
         self.stack_state.save_stack(&stack)?;
         self.current_stack = Some(stack);
@@ -2142,12 +2146,10 @@ impl StackManager {
     ) {
         if let Some(children) = hierarchy.get(branch_name) {
             for child in children {
-                self.print_branch_details_with_status(child, stack, branch_mr_status, indent + 1);
-                self.print_children_recursive_with_status(
+                self.print_branch_hierarchy_with_status(
                     hierarchy,
                     stack,
                     branch_mr_status,
-                    child,
                     indent + 1,
                 );
             }
@@ -2168,6 +2170,68 @@ impl StackManager {
         // Fallback to a warning and user input if needed
         print_warning("Could not determine a default base branch ('main' or 'master' not found)");
         get_user_input("Please enter the base branch name:", None)
+    }
+
+    async fn update_all_mr_descriptions(&self, stack: &Stack) {
+        if self.gitlab_client.is_none() {
+            return;
+        }
+        let gitlab = self.gitlab_client.as_ref().unwrap();
+
+        print_info("Updating all MR descriptions with stack view...");
+
+        // 1. Collect all MR iids
+        let iids: Vec<u64> = stack.branches.values().filter_map(|b| b.mr_iid).collect();
+        if iids.is_empty() {
+            print_info("No merge requests to update.");
+            return;
+        }
+
+        // 2. Fetch all MRs concurrently
+        let mr_futures = iids.iter().map(|&iid| gitlab.get_merge_request(iid));
+        let results = future::join_all(mr_futures).await;
+
+        let mrs: HashMap<u64, MergeRequest> = results
+            .into_iter()
+            .filter_map(|res| res.ok())
+            .map(|mr| (mr.iid, mr))
+            .collect();
+
+        if mrs.len() != iids.len() {
+            print_warning("Could not fetch all merge requests, description update may be incomplete.");
+        }
+
+        // 3. Build the universal stack table
+        let stack_table = markdown::build_stack_table(stack, &mrs);
+
+        // 4. Update all MRs concurrently
+        let update_futures = mrs.values().map(|mr| {
+            let new_description =
+                markdown::update_description(&mr.description, &stack_table);
+            gitlab.update_merge_request(mr.iid, None, Some(new_description))
+        });
+
+        let update_results = future::join_all(update_futures).await;
+
+        let mut success_count = 0;
+        for result in update_results {
+            match result {
+                Ok(mr) => {
+                    print_info(&format!("Updated description for MR !{}", mr.iid));
+                    success_count += 1;
+                }
+                Err(e) => {
+                    print_warning(&format!("Failed to update an MR description: {}", e));
+                }
+            }
+        }
+
+        if success_count > 0 {
+            print_success(&format!(
+                "Successfully updated {} MR descriptions.",
+                success_count
+            ));
+        }
     }
 
     async fn propagate_changes(&self, stack: &mut Stack, changed_branch: &str) -> Result<()> {
