@@ -9,7 +9,7 @@ use gittrain::gitlab::{
 use gittrain::stack::StackManager;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
@@ -296,12 +296,13 @@ mod integration_tests {
 
         let mrs_after = mrs.lock().unwrap();
         assert_eq!(mrs_after.len(), 2);
-        let mr1_after = mrs_after.get(&1).unwrap();
-        let mr2_after = mrs_after.get(&2).unwrap();
+        
+        let mr_feature1 = mrs_after.values().find(|mr| mr.source_branch == "feature-1").unwrap();
+        let mr_feature2 = mrs_after.values().find(|mr| mr.source_branch == "feature-2").unwrap();
 
-        assert_eq!(mr1_after.title, "[Stack: my-stack] feat: update file1");
-        assert_eq!(mr2_after.title, "[Stack: my-stack] feat: add file2");
-        assert_eq!(mr2_after.target_branch, "feature-1");
+        assert_eq!(mr_feature1.title, "[Stack: my-stack] feat: update file1");
+        assert_eq!(mr_feature2.title, "[Stack: my-stack] feat: add file2");
+        assert_eq!(mr_feature2.target_branch, "feature-1");
 
         Ok(())
     }
