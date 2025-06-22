@@ -1,11 +1,27 @@
 use anyhow::Result;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
 use crate::config::TrainConfig;
 use crate::errors::TrainError;
 use crate::git::GitRepository;
 use crate::ui;
+
+pub trait EditorLauncher: Send + Sync {
+    fn launch(&self, editor: &str, args: &[String], file: &str) -> Result<ExitStatus>;
+}
+
+pub struct DefaultEditorLauncher;
+
+impl EditorLauncher for DefaultEditorLauncher {
+    fn launch(&self, editor: &str, args: &[String], file: &str) -> Result<ExitStatus> {
+        let mut cmd = Command::new(editor);
+        cmd.args(args);
+        cmd.arg(file);
+        let status = cmd.status()?;
+        Ok(status)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ConflictInfo {
@@ -40,6 +56,7 @@ pub struct ConflictResolver {
     config: TrainConfig,
     git_dir: PathBuf,
     git_repo: GitRepository,
+    editor_launcher: Box<dyn EditorLauncher>,
 }
 
 impl ConflictResolver {
@@ -48,8 +65,10 @@ impl ConflictResolver {
             config,
             git_dir,
             git_repo,
+            editor_launcher: Box::new(DefaultEditorLauncher),
         }
     }
+
 
     /// Check the current git state for conflicts
     pub fn get_git_state(&self) -> Result<GitState> {
@@ -57,35 +76,20 @@ impl ConflictResolver {
 
         // First check for ongoing operations, then conflicts within those operations
         if git_dir.join("REBASE_HEAD").exists() {
-            // Double-check if rebase is actually in progress
             if self.is_rebase_actually_active()? {
                 return Ok(GitState::Rebasing);
-            } else {
-                // Clean up stale rebase state using safe git command
-                ui::print_info("Detected stale rebase state files, cleaning up...");
-                self.cleanup_stale_rebase_files()?;
             }
         }
 
         if git_dir.join("MERGE_HEAD").exists() {
-            // Double-check if merge is actually in progress
             if self.is_merge_actually_active()? {
                 return Ok(GitState::Merging);
-            } else {
-                ui::print_info("Detected stale merge state files, cleaning up...");
-                // Clean up stale merge state using safe git command
-                self.cleanup_stale_merge_files()?;
             }
         }
 
         if git_dir.join("CHERRY_PICK_HEAD").exists() {
-            // Double-check if cherry-pick is actually in progress
             if self.is_cherry_pick_actually_active()? {
                 return Ok(GitState::CherryPicking);
-            } else {
-                ui::print_info("Detected stale cherry-pick state files, cleaning up...");
-                // Clean up stale cherry-pick state using safe git command
-                self.cleanup_stale_cherry_pick_files()?;
             }
         }
 
@@ -129,21 +133,16 @@ impl ConflictResolver {
 
     /// Check if a merge is actually in progress
     fn is_merge_actually_active(&self) -> Result<bool> {
-        // Check if MERGE_MSG exists and is recent, and if there are actual merge conflicts
-        let git_dir = &self.git_dir;
-        Ok(git_dir.join("MERGE_MSG").exists() && git_dir.join("MERGE_HEAD").exists())
+        let status = self.git_repo.run(&["status", "--porcelain"])?;
+        let has_unmerged = status.lines().any(|l| l.starts_with('U'));
+        Ok(has_unmerged)
     }
 
     /// Check if a cherry-pick is actually in progress
     fn is_cherry_pick_actually_active(&self) -> Result<bool> {
-        // Try to continue cherry-pick to see if it's actually in progress
-        match self
-            .git_repo
-            .run(&["cherry-pick", "--continue", "--dry-run"])
-        {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
+        let status = self.git_repo.run(&["status", "--porcelain"])?;
+        let has_unmerged = status.lines().any(|l| l.starts_with('U'));
+        Ok(has_unmerged)
     }
 
     /// Clean up stale rebase state using `git rebase --abort`
@@ -158,29 +157,6 @@ impl ConflictResolver {
         Ok(())
     }
 
-    /// Clean up stale merge files
-    fn cleanup_stale_merge_files(&self) -> Result<()> {
-        match self.git_repo.run(&["merge", "--abort"]) {
-            Ok(_) => ui::print_info("Ran 'git merge --abort' to clean stale state"),
-            Err(e) => ui::print_warning(&format!(
-                "Could not run 'git merge --abort': {} (state may already be clean)",
-                e
-            )),
-        }
-        Ok(())
-    }
-
-    /// Clean up stale cherry-pick files
-    fn cleanup_stale_cherry_pick_files(&self) -> Result<()> {
-        match self.git_repo.run(&["cherry-pick", "--abort"]) {
-            Ok(_) => ui::print_info("Ran 'git cherry-pick --abort' to clean stale state"),
-            Err(e) => ui::print_warning(&format!(
-                "Could not run 'git cherry-pick --abort': {} (state may already be clean)",
-                e
-            )),
-        }
-        Ok(())
-    }
 
     /// Detect and analyze conflicts in the repository
     pub fn detect_conflicts(&self) -> Result<Option<ConflictInfo>> {
@@ -249,7 +225,11 @@ impl ConflictResolver {
             };
 
         match choice {
-            0 => self.open_editor_for_conflicts(conflict_info).await,
+            0 => {
+                let state = self.get_git_state()?;
+                self.open_editor_for_conflicts(conflict_info).await?;
+                self.verify_conflicts_resolved(conflict_info, state).await
+            }
             1 => {
                 self.abort_current_operation()?;
                 ui::print_success("Current operation aborted. Repository is now clean.");
@@ -271,11 +251,10 @@ impl ConflictResolver {
                 conflict_file.path, editor_config.default_editor
             ));
 
-            let mut cmd = Command::new(&editor_config.default_editor);
-            cmd.args(&editor_config.editor_args);
-            cmd.arg(&conflict_file.path);
-
-            match cmd.status() {
+            match self
+                .editor_launcher
+                .launch(&editor_config.default_editor, &editor_config.editor_args, &conflict_file.path)
+            {
                 Ok(status) => {
                     if !status.success() {
                         ui::print_warning(&format!(
@@ -323,28 +302,30 @@ impl ConflictResolver {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
 
-        // Verify conflicts are resolved
-        self.verify_conflicts_resolved(conflict_info).await
+        Ok(())
     }
 
     /// Verify that all conflicts have been resolved
-    pub async fn verify_conflicts_resolved(&self, original: &ConflictInfo) -> Result<()> {
-        let current_conflicts = self.detect_conflicts()?;
+    pub async fn verify_conflicts_resolved(&self, original: &ConflictInfo, initial_state: GitState) -> Result<()> {
+        loop {
+            let current_conflicts = self.detect_conflicts()?;
+            if let Some(conflicts) = current_conflicts {
+                ui::print_error(&format!(
+                    "Still have {} unresolved conflicts",
+                    conflicts.files.len()
+                ));
 
-        if let Some(conflicts) = current_conflicts {
-            ui::print_error(&format!(
-                "Still have {} unresolved conflicts",
-                conflicts.files.len()
-            ));
-
-            if ui::confirm_action("Do you want to continue editing?")? {
-                return Box::pin(self.open_editor_for_conflicts(&conflicts)).await;
-            } else {
-                return Err(TrainError::InvalidState {
-                    message: "Conflicts not resolved".to_string(),
+                if ui::confirm_action("Do you want to continue editing?")? {
+                    self.open_editor_for_conflicts(&conflicts).await?;
+                    continue;
+                } else {
+                    return Err(TrainError::InvalidState {
+                        message: "Conflicts not resolved".to_string(),
+                    }
+                    .into());
                 }
-                .into());
             }
+            break;
         }
 
         // Add only the files that were conflicted
@@ -352,7 +333,7 @@ impl ConflictResolver {
             self.git_repo.run(&["add", &f.path])?;
         }
 
-        match self.get_git_state()? {
+        match initial_state {
             GitState::Rebasing => {
                 self.git_repo.run(&["rebase", "--continue"])?;
                 ui::print_success("Rebase continued successfully");
@@ -515,7 +496,7 @@ mod tests {
             }],
         };
 
-        resolver.verify_conflicts_resolved(&info).await?;
+        resolver.verify_conflicts_resolved(&info, GitState::Clean).await?;
 
         let out = Command::new("git")
             .args(["diff", "--name-only", "--cached"])

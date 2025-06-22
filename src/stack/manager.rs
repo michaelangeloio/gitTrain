@@ -1515,9 +1515,10 @@ impl StackManager {
                                 .auto_resolve_conflicts(&conflicts)
                                 .await?
                             {
+                                let state = self.conflict_resolver.get_git_state()?;
                                 self
                                     .conflict_resolver
-                                    .verify_conflicts_resolved(&conflicts)
+                                    .verify_conflicts_resolved(&conflicts, state)
                                     .await?;
                                 print_success(
                                     "Automatically resolved conflicts and completed operation",
