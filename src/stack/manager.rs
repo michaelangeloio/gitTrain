@@ -9,7 +9,7 @@ use crate::config::TrainConfig;
 use crate::conflict::{ConflictResolver, GitState};
 use crate::errors::TrainError;
 use crate::git::GitRepository;
-use crate::gitlab::{CreateMergeRequestRequest, GitLabApi, GitLabClient};
+use crate::gitlab::api::{CreateMergeRequestRequest, GitLabApi, GitLabClient};
 use crate::stack::state::StackState;
 use crate::stack::types::{Stack, StackBranch};
 use crate::ui::{
@@ -172,7 +172,7 @@ impl StackManager {
 
         // Restore stashed changes if we created a stash
         if stash_created {
-            if let Err(_) = self.git_repo.run(&["stash", "pop"]) {
+            if self.git_repo.run(&["stash", "pop"]).is_err() {
                 print_warning("Could not automatically restore stashed changes. Run 'git stash pop' manually if needed.");
             } else {
                 print_info("Restored stashed changes");
@@ -732,7 +732,7 @@ impl StackManager {
 
         // Restore stashed changes if we created a stash
         if has_uncommitted {
-            if let Err(_) = self.git_repo.run(&["stash", "pop"]) {
+            if self.git_repo.run(&["stash", "pop"]).is_err() {
                 print_warning("Could not automatically restore stashed changes. Run 'git stash pop' manually if needed.");
             } else {
                 print_info("Restored stashed changes");
@@ -780,7 +780,7 @@ impl StackManager {
 
         // Find all branches that need to be rebased (downstream from the from_branch)
         let mut branches_to_rebase = Vec::new();
-        self.collect_downstream_branches(&hierarchy, from_branch, &mut branches_to_rebase);
+        Self::collect_downstream_branches(&hierarchy, from_branch, &mut branches_to_rebase);
 
         // Sort to ensure we rebase in the correct order (parents before children)
         branches_to_rebase.sort_by(|a, b| {
@@ -810,7 +810,6 @@ impl StackManager {
 
     /// Collect all downstream branches recursively
     fn collect_downstream_branches(
-        &self,
         hierarchy: &HashMap<String, Vec<String>>,
         branch: &str,
         result: &mut Vec<String>,
@@ -818,7 +817,7 @@ impl StackManager {
         if let Some(children) = hierarchy.get(branch) {
             for child in children {
                 result.push(child.clone());
-                self.collect_downstream_branches(hierarchy, child, result);
+                Self::collect_downstream_branches(hierarchy, child, result);
             }
         }
     }

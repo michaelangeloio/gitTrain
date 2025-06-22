@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::gitlab::GitLabProject;
+use crate::gitlab::api::GitLabProject;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StackBranch {

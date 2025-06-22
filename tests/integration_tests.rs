@@ -3,7 +3,7 @@
 use anyhow::Result;
 use gittrain::config::TrainConfig;
 use gittrain::git::GitRepository;
-use gittrain::gitlab::{
+use gittrain::gitlab::api::{
     CreateMergeRequestRequest, GitLabApi, GitLabNamespace, GitLabProject, MergeRequest,
 };
 use gittrain::stack::StackManager;
