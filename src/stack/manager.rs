@@ -2150,10 +2150,17 @@ impl StackManager {
     ) {
         if let Some(children) = hierarchy.get(branch_name) {
             for child in children {
-                self.print_branch_hierarchy_with_status(
+                self.print_branch_details_with_status(
+                    child,
+                    stack,
+                    branch_mr_status,
+                    indent,
+                );
+                self.print_children_recursive_with_status(
                     hierarchy,
                     stack,
                     branch_mr_status,
+                    child,
                     indent + 1,
                 );
             }
@@ -2368,17 +2375,26 @@ impl StackManager {
             .await?;
 
         if let Some(mr_iid) = branch.mr_iid {
-            // MR exists, update it including title if commit message changed
+            // MR exists, fetch current state from GitLab to respect manual changes
+            let current_mr = gitlab_client.get_merge_request(mr_iid).await?;
             let current_commit_message = self.git_repo.get_commit_message_for_branch(branch_name)?;
             let expected_mr_title = format!("[Stack: {}] {}", stack.name, current_commit_message);
             
-            // Check if title needs updating
-            let title_update = if branch.mr_title.as_ref() != Some(&expected_mr_title) {
+            // Only update title if it's currently auto-generated (starts with [Stack: stack_name])
+            // This preserves manually set titles on GitLab
+            let title_update = if current_mr.title.starts_with(&format!("[Stack: {}]", stack.name)) 
+                && current_mr.title != expected_mr_title {
                 print_info(&format!(
-                    "Updating MR !{} title to reflect commit message change",
+                    "Updating auto-generated MR !{} title to reflect commit message change",
                     mr_iid
                 ));
                 Some(expected_mr_title.clone())
+            } else if !current_mr.title.starts_with(&format!("[Stack: {}]", stack.name)) {
+                print_info(&format!(
+                    "Preserving manually set title for MR !{}: '{}'",
+                    mr_iid, current_mr.title
+                ));
+                None
             } else {
                 None
             };
@@ -2391,9 +2407,9 @@ impl StackManager {
                 .update_merge_request_with_target(mr_iid, title_update, None, Some(target_branch))
                 .await?;
             
-            // Update stored title in stack
+            // Update stored title in stack to reflect current GitLab state
             if let Some(b) = stack.branches.get_mut(branch_name) {
-                b.mr_title = Some(expected_mr_title);
+                b.mr_title = Some(updated_mr.title.clone());
                 b.updated_at = Utc::now();
             }
             
