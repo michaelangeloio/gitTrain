@@ -11,6 +11,7 @@ pub struct StackBranch {
     pub children: Vec<String>,
     pub commit_hash: String,
     pub mr_iid: Option<u64>,
+    pub mr_title: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

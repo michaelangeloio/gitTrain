@@ -97,6 +97,7 @@ mod tests {
             children: vec!["feature-2".to_string()],
             commit_hash: "hash1".to_string(),
             mr_iid: Some(101),
+            mr_title: Some("Feat: part 1".to_string()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
@@ -106,6 +107,7 @@ mod tests {
             children: vec![],
             commit_hash: "hash2".to_string(),
             mr_iid: Some(102),
+            mr_title: Some("Feat: part 2".to_string()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });

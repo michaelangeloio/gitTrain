@@ -50,6 +50,11 @@ impl GitRepository {
         Ok(output.trim().to_string())
     }
 
+    pub fn get_commit_message_for_branch(&self, branch_name: &str) -> Result<String> {
+        let output = self.run(&["log", "-1", "--pretty=%s", branch_name])?;
+        Ok(output.trim().to_string())
+    }
+
     pub fn has_uncommitted_changes(&self) -> Result<bool> {
         let output = self.run(&["status", "--porcelain"])?;
         Ok(!output.is_empty())

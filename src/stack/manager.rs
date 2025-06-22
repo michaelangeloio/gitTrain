@@ -308,6 +308,7 @@ impl StackManager {
             children: vec![],
             commit_hash: current_commit,
             mr_iid: None,
+            mr_title: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -983,6 +984,7 @@ impl StackManager {
             children: vec![],
             commit_hash: current_commit,
             mr_iid: None,
+            mr_title: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1492,7 +1494,7 @@ impl StackManager {
         self.process_all_branches_for_mrs(&mut stack, "Updated merge request for")
             .await;
 
-        self.update_all_mr_descriptions(&stack).await;
+        self.update_all_mr_descriptions(&mut stack).await;
 
         // Save the updated stack with MR IIDs
         self.stack_state.save_stack(&stack)?;
@@ -1905,6 +1907,8 @@ impl StackManager {
                 "Updated MR targets for",
             )
             .await;
+
+            self.update_all_mr_descriptions(&mut updated_stack).await;
         }
 
         // Switch back to the original branch
@@ -2172,7 +2176,7 @@ impl StackManager {
         get_user_input("Please enter the base branch name:", None)
     }
 
-    async fn update_all_mr_descriptions(&self, stack: &Stack) {
+    async fn update_all_mr_descriptions(&self, stack: &mut Stack) {
         if self.gitlab_client.is_none() {
             return;
         }
@@ -2196,6 +2200,15 @@ impl StackManager {
             .filter_map(|res| res.ok())
             .map(|mr| (mr.iid, mr))
             .collect();
+
+        // Sync titles back to local stack state
+        for branch in stack.branches.values_mut() {
+            if let Some(iid) = branch.mr_iid {
+                if let Some(mr) = mrs.get(&iid) {
+                    branch.mr_title = Some(mr.title.clone());
+                }
+            }
+        }
 
         if mrs.len() != iids.len() {
             print_warning("Could not fetch all merge requests, description update may be incomplete.");
@@ -2343,63 +2356,62 @@ impl StackManager {
         branch: &StackBranch,
         stack: &mut Stack,
     ) -> Result<()> {
+        let gitlab_client =
+            self.gitlab_client
+                .as_ref()
+                .ok_or_else(|| TrainError::GitLabError {
+                    message: "GitLab client not available".to_string(),
+                })?;
+
         let target_branch = self
-            .determine_optimal_target_branch(branch_name, stack, gitlab_client)
+            .determine_optimal_target_branch(branch_name, stack, gitlab_client.as_ref())
             .await?;
 
-        // Fetch the latest commit message to use as the MR title
-        let commit_message =
-            self.git_repo
-                .run(&["log", "-1", "--pretty=%s", &branch.commit_hash])?;
-        let mr_title = format!("[Stack: {}] {}", stack.name, commit_message.trim());
-
-        let mr_description = Some(format!(
-            "This MR is part of stack '{}'.\n\n**Stack Branches:**\n{}",
-            stack.name,
-            stack
-                .branches
-                .keys()
-                .cloned()
-                .collect::<Vec<String>>()
-                .join("\n")
-        ));
-
-        if let Some(iid) = branch.mr_iid {
-            // Update existing MR
-            print_info(&format!("Updating MR !{} for branch {}", iid, branch_name));
-            gitlab_client
-                .update_merge_request_with_target(
-                    iid,
-                    Some(mr_title),
-                    mr_description,
-                    Some(target_branch.clone()),
-                )
-                .await?;
-            print_success(&format!(
-                "Updated MR !{} with target '{}'",
-                iid, target_branch
-            ));
-        } else {
-            // Create new MR
+        if let Some(mr_iid) = branch.mr_iid {
+            // MR exists, update it (but not the title)
             print_info(&format!(
-                "Creating MR for branch {} targeting {}",
+                "Updating MR !{} for branch '{}' to target '{}'",
+                mr_iid, branch_name, target_branch
+            ));
+            let updated_mr = gitlab_client
+                .update_merge_request_with_target(mr_iid, None, None, Some(target_branch))
+                .await?;
+            print_success(&format!("Updated MR: {}", updated_mr.web_url));
+        } else {
+            // MR does not exist, create it
+            let commit_message = self.git_repo.get_commit_message_for_branch(branch_name)?;
+            let mr_title = format!("[Stack: {}] {}", stack.name, commit_message);
+
+            // Check for MR template
+            let template_description = {
+                let repo_root_output = self.git_repo.run(&["rev-parse", "--show-toplevel"])?;
+                let repo_root = std::path::PathBuf::from(repo_root_output.trim());
+                let template_path = repo_root.join(".gitlab").join("merge_request_template.md");
+                if template_path.exists() {
+                    print_info("Found .gitlab/merge_request_template.md, using it.");
+                    fs::read_to_string(template_path).ok()
+                } else {
+                    None
+                }
+            };
+
+            print_info(&format!(
+                "Creating MR for branch '{}' targeting '{}'",
                 branch_name, target_branch
             ));
             let request = CreateMergeRequestRequest {
-                title: mr_title,
-                description: mr_description,
                 source_branch: branch_name.to_string(),
-                target_branch: target_branch.clone(),
+                target_branch,
+                title: mr_title.clone(),
+                description: template_description,
             };
-            let mr = gitlab_client.create_merge_request(request).await?;
-            print_success(&format!(
-                "Created MR !{} for branch {}",
-                mr.iid, branch_name
-            ));
+            let new_mr = gitlab_client.create_merge_request(request).await?;
+            print_success(&format!("Created MR: {}", new_mr.web_url));
 
-            // Store new IID in the stack
+            // Store new MR info in stack
             if let Some(b) = stack.branches.get_mut(branch_name) {
-                b.mr_iid = Some(mr.iid);
+                b.mr_iid = Some(new_mr.iid);
+                b.mr_title = Some(mr_title);
                 b.updated_at = Utc::now();
             }
         }
