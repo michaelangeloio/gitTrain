@@ -1,11 +1,12 @@
 use crate::errors::TrainError;
-use crate::utils::run_git_command;
+use crate::git::GitRepository;
 use anyhow::Result;
+use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MergeRequest {
     pub id: u64,
     pub iid: u64,
@@ -52,16 +53,40 @@ pub struct ProjectInfo {
     pub project: String,
 }
 
+#[async_trait]
+pub trait GitLabApi: Send + Sync {
+    async fn detect_and_cache_project(&self) -> Result<GitLabProject>;
+    async fn create_merge_request(
+        &self,
+        request: CreateMergeRequestRequest,
+    ) -> Result<MergeRequest>;
+    async fn update_merge_request(
+        &self,
+        iid: u64,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<MergeRequest>;
+    async fn update_merge_request_with_target(
+        &self,
+        iid: u64,
+        title: Option<String>,
+        description: Option<String>,
+        target_branch: Option<String>,
+    ) -> Result<MergeRequest>;
+    async fn get_merge_request(&self, iid: u64) -> Result<MergeRequest>;
+}
+
 pub struct GitLabClient {
     client: Client,
     base_url: String,
     token: String,
     project_info: RwLock<Option<ProjectInfo>>,
     project_details: RwLock<Option<GitLabProject>>,
+    git_repo: GitRepository,
 }
 
 impl GitLabClient {
-    pub async fn new() -> Result<Self> {
+    pub async fn new(git_repo: GitRepository) -> Result<Self> {
         let token = std::env::var("GITLAB_TOKEN").map_err(|_| TrainError::SecurityError {
             message: "GITLAB_TOKEN environment variable not set".to_string(),
         })?;
@@ -77,65 +102,13 @@ impl GitLabClient {
             token,
             project_info: RwLock::new(None),
             project_details: RwLock::new(None),
+            git_repo,
         })
-    }
-
-    pub async fn detect_and_cache_project(&self) -> Result<GitLabProject> {
-        // Check if project is already cached
-        {
-            let project_details = self.project_details.read().await;
-            if let Some(ref project) = *project_details {
-                return Ok(project.clone());
-            }
-        }
-
-        // Try to auto-detect project from git remotes
-        match self.detect_project_from_remotes().await {
-            Ok((info, details)) => {
-                // Cache both project info and details
-                {
-                    let mut project_info = self.project_info.write().await;
-                    *project_info = Some(info);
-                }
-                {
-                    let mut project_details = self.project_details.write().await;
-                    *project_details = Some(details.clone());
-                }
-                Ok(details)
-            }
-            Err(_) => {
-                // Fall back to environment variables if available
-                if let Ok(project_id) = std::env::var("GITLAB_PROJECT_ID") {
-                    if let Ok(project_details) = Self::get_project_by_id(
-                        &self.base_url,
-                        &self.token,
-                        &self.client,
-                        &project_id,
-                    )
-                    .await
-                    {
-                        // Cache the project details
-                        {
-                            let mut cached_details = self.project_details.write().await;
-                            *cached_details = Some(project_details.clone());
-                        }
-                        return Ok(project_details);
-                    }
-                }
-
-                Err(TrainError::GitLabError {
-                    message:
-                        "Could not detect GitLab project from git remotes or GITLAB_PROJECT_ID"
-                            .to_string(),
-                }
-                .into())
-            }
-        }
     }
 
     async fn detect_project_from_remotes(&self) -> Result<(ProjectInfo, GitLabProject)> {
         // Get all git remotes
-        let remotes_output = run_git_command(&["remote", "-v"])?;
+        let remotes_output = self.git_repo.run(&["remote", "-v"])?;
 
         for line in remotes_output.lines() {
             if let Some(project_info) = Self::parse_gitlab_remote(line)? {
@@ -293,8 +266,64 @@ impl GitLabClient {
         let project = self.detect_and_cache_project().await?;
         Ok(project.id.to_string())
     }
+}
 
-    pub async fn create_merge_request(
+#[async_trait]
+impl GitLabApi for GitLabClient {
+    async fn detect_and_cache_project(&self) -> Result<GitLabProject> {
+        // Check if project is already cached
+        {
+            let project_details = self.project_details.read().await;
+            if let Some(ref project) = *project_details {
+                return Ok(project.clone());
+            }
+        }
+
+        // Try to auto-detect project from git remotes
+        match self.detect_project_from_remotes().await {
+            Ok((info, details)) => {
+                // Cache both project info and details
+                {
+                    let mut project_info = self.project_info.write().await;
+                    *project_info = Some(info);
+                }
+                {
+                    let mut project_details = self.project_details.write().await;
+                    *project_details = Some(details.clone());
+                }
+                Ok(details)
+            }
+            Err(_) => {
+                // Fall back to environment variables if available
+                if let Ok(project_id) = std::env::var("GITLAB_PROJECT_ID") {
+                    if let Ok(project_details) = Self::get_project_by_id(
+                        &self.base_url,
+                        &self.token,
+                        &self.client,
+                        &project_id,
+                    )
+                    .await
+                    {
+                        // Cache the project details
+                        {
+                            let mut cached_details = self.project_details.write().await;
+                            *cached_details = Some(project_details.clone());
+                        }
+                        return Ok(project_details);
+                    }
+                }
+
+                Err(TrainError::GitLabError {
+                    message:
+                        "Could not detect GitLab project from git remotes or GITLAB_PROJECT_ID"
+                            .to_string(),
+                }
+                .into())
+            }
+        }
+    }
+
+    async fn create_merge_request(
         &self,
         request: CreateMergeRequestRequest,
     ) -> Result<MergeRequest> {
@@ -324,7 +353,7 @@ impl GitLabClient {
         }
     }
 
-    pub async fn update_merge_request(
+    async fn update_merge_request(
         &self,
         iid: u64,
         title: Option<String>,
@@ -367,8 +396,7 @@ impl GitLabClient {
         }
     }
 
-    /// Update merge request with optional target branch change
-    pub async fn update_merge_request_with_target(
+    async fn update_merge_request_with_target(
         &self,
         iid: u64,
         title: Option<String>,
@@ -418,8 +446,7 @@ impl GitLabClient {
         }
     }
 
-    /// Get the current state of a merge request
-    pub async fn get_merge_request(&self, iid: u64) -> Result<MergeRequest> {
+    async fn get_merge_request(&self, iid: u64) -> Result<MergeRequest> {
         let project_id = self.get_project_id_for_api().await?;
         let url = format!(
             "{}/api/v4/projects/{}/merge_requests/{}",
