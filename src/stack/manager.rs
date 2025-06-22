@@ -2368,14 +2368,35 @@ impl StackManager {
             .await?;
 
         if let Some(mr_iid) = branch.mr_iid {
-            // MR exists, update it (but not the title)
+            // MR exists, update it including title if commit message changed
+            let current_commit_message = self.git_repo.get_commit_message_for_branch(branch_name)?;
+            let expected_mr_title = format!("[Stack: {}] {}", stack.name, current_commit_message);
+            
+            // Check if title needs updating
+            let title_update = if branch.mr_title.as_ref() != Some(&expected_mr_title) {
+                print_info(&format!(
+                    "Updating MR !{} title to reflect commit message change",
+                    mr_iid
+                ));
+                Some(expected_mr_title.clone())
+            } else {
+                None
+            };
+            
             print_info(&format!(
                 "Updating MR !{} for branch '{}' to target '{}'",
                 mr_iid, branch_name, target_branch
             ));
             let updated_mr = gitlab_client
-                .update_merge_request_with_target(mr_iid, None, None, Some(target_branch))
+                .update_merge_request_with_target(mr_iid, title_update, None, Some(target_branch))
                 .await?;
+            
+            // Update stored title in stack
+            if let Some(b) = stack.branches.get_mut(branch_name) {
+                b.mr_title = Some(expected_mr_title);
+                b.updated_at = Utc::now();
+            }
+            
             print_success(&format!("Updated MR: {}", updated_mr.web_url));
         } else {
             // MR does not exist, create it

@@ -14,22 +14,8 @@ pub fn build_stack_table(stack: &Stack, mrs: &HashMap<u64, MergeRequest>) -> Str
     table.push_str("| Position | Branch | Merge Request |\n");
     table.push_str("|---|---|---|\n");
 
-    // Find the head of the stack (first branch after base)
-    let head_branch_name = stack.branches.values().find(|b| b.parent.as_deref() == Some(&stack.base_branch)).map(|b| b.name.clone());
-
-    let mut branches_in_order = vec![];
-    if let Some(head) = head_branch_name {
-        let mut current_branch_name = head.clone();
-        while let Some(current_branch) = stack.branches.get(&current_branch_name) {
-            branches_in_order.push(current_branch.clone());
-            if let Some(child) = current_branch.children.first() {
-                current_branch_name = child.clone();
-            } else {
-                break;
-            }
-        }
-    }
-
+    // Collect all branches in hierarchical order (depth-first traversal)
+    let branches_in_order = collect_branches_in_order(stack);
 
     for (i, branch) in branches_in_order.iter().enumerate() {
         let position = format!("#{}", i + 1);
@@ -59,6 +45,72 @@ pub fn build_stack_table(stack: &Stack, mrs: &HashMap<u64, MergeRequest>) -> Str
     table.push_str(STACK_TABLE_END);
 
     table
+}
+
+/// Collect all branches in the stack in hierarchical order
+/// This performs a depth-first traversal starting from branches that have the base branch as parent
+fn collect_branches_in_order(stack: &Stack) -> Vec<crate::stack::types::StackBranch> {
+    let mut result = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    
+    // Build a parent -> children mapping for efficient traversal
+    let mut hierarchy: HashMap<String, Vec<String>> = HashMap::new();
+    for (branch_name, branch) in &stack.branches {
+        if let Some(parent) = &branch.parent {
+            hierarchy
+                .entry(parent.clone())
+                .or_default()
+                .push(branch_name.clone());
+        }
+    }
+    
+    // Sort children by name for consistent ordering
+    for children in hierarchy.values_mut() {
+        children.sort();
+    }
+    
+    // Start traversal from branches that have the base branch as parent
+    if let Some(root_branches) = hierarchy.get(&stack.base_branch) {
+        for root_branch in root_branches {
+            collect_branch_recursive(stack, &hierarchy, root_branch, &mut result, &mut visited);
+        }
+    }
+    
+    // Also include any branches that might not have been visited
+    // (in case of disconnected branches or circular references)
+    for (branch_name, branch) in &stack.branches {
+        if !visited.contains(branch_name) {
+            result.push(branch.clone());
+        }
+    }
+    
+    result
+}
+
+/// Recursively collect branches in depth-first order
+fn collect_branch_recursive(
+    stack: &Stack, 
+    hierarchy: &HashMap<String, Vec<String>>,
+    branch_name: &str,
+    result: &mut Vec<crate::stack::types::StackBranch>,
+    visited: &mut std::collections::HashSet<String>,
+) {
+    // Avoid infinite loops
+    if visited.contains(branch_name) {
+        return;
+    }
+    
+    if let Some(branch) = stack.branches.get(branch_name) {
+        visited.insert(branch_name.to_string());
+        result.push(branch.clone());
+        
+        // Recursively collect children
+        if let Some(children) = hierarchy.get(branch_name) {
+            for child in children {
+                collect_branch_recursive(stack, hierarchy, child, result, visited);
+            }
+        }
+    }
 }
 
 pub fn update_description(current_description: &Option<String>, new_table: &str) -> String {
@@ -148,6 +200,106 @@ mod tests {
         (stack, mrs)
     }
 
+    fn create_complex_test_stack_and_mrs() -> (Stack, HashMap<u64, MergeRequest>) {
+        let mut branches = HashMap::new();
+        // Create a more complex stack with multiple branches
+        branches.insert("feature-1".to_string(), StackBranch {
+            name: "feature-1".to_string(),
+            parent: Some("main".to_string()),
+            children: vec!["feature-2".to_string(), "feature-3".to_string()],
+            commit_hash: "hash1".to_string(),
+            mr_iid: Some(101),
+            mr_title: Some("Feat: part 1".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        branches.insert("feature-2".to_string(), StackBranch {
+            name: "feature-2".to_string(),
+            parent: Some("feature-1".to_string()),
+            children: vec![],
+            commit_hash: "hash2".to_string(),
+            mr_iid: Some(102),
+            mr_title: Some("Feat: part 2".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        branches.insert("feature-3".to_string(), StackBranch {
+            name: "feature-3".to_string(),
+            parent: Some("feature-1".to_string()),
+            children: vec![],
+            commit_hash: "hash3".to_string(),
+            mr_iid: Some(103),
+            mr_title: Some("Feat: part 3".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        branches.insert("feature-4".to_string(), StackBranch {
+            name: "feature-4".to_string(),
+            parent: Some("main".to_string()),
+            children: vec![],
+            commit_hash: "hash4".to_string(),
+            mr_iid: Some(104),
+            mr_title: Some("Feat: part 4".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+
+        let stack = Stack {
+            id: "stack-1".to_string(),
+            name: "test-stack".to_string(),
+            base_branch: "main".to_string(),
+            branches,
+            current_branch: Some("feature-2".to_string()),
+            gitlab_project: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let mut mrs = HashMap::new();
+        mrs.insert(101, MergeRequest {
+            id: 1,
+            iid: 101,
+            title: "Feat: part 1".to_string(),
+            description: Some("".to_string()),
+            source_branch: "feature-1".to_string(),
+            target_branch: "main".to_string(),
+            state: "opened".to_string(),
+            web_url: "https://gitlab.com/test/repo/-/merge_requests/101".to_string(),
+        });
+        mrs.insert(102, MergeRequest {
+            id: 2,
+            iid: 102,
+            title: "Feat: part 2".to_string(),
+            description: Some("".to_string()),
+            source_branch: "feature-2".to_string(),
+            target_branch: "feature-1".to_string(),
+            state: "opened".to_string(),
+            web_url: "https://gitlab.com/test/repo/-/merge_requests/102".to_string(),
+        });
+        mrs.insert(103, MergeRequest {
+            id: 3,
+            iid: 103,
+            title: "Feat: part 3".to_string(),
+            description: Some("".to_string()),
+            source_branch: "feature-3".to_string(),
+            target_branch: "feature-1".to_string(),
+            state: "opened".to_string(),
+            web_url: "https://gitlab.com/test/repo/-/merge_requests/103".to_string(),
+        });
+        mrs.insert(104, MergeRequest {
+            id: 4,
+            iid: 104,
+            title: "Feat: part 4".to_string(),
+            description: Some("".to_string()),
+            source_branch: "feature-4".to_string(),
+            target_branch: "main".to_string(),
+            state: "opened".to_string(),
+            web_url: "https://gitlab.com/test/repo/-/merge_requests/104".to_string(),
+        });
+
+        (stack, mrs)
+    }
+
     #[test]
     fn test_build_stack_table() {
         let (stack, mrs) = create_test_stack_and_mrs();
@@ -157,6 +309,31 @@ mod tests {
         assert!(table.contains(STACK_TABLE_END));
         assert!(table.contains("| #1 | `feature-1` | [Feat: part 1](https://gitlab.com/test/repo/-/merge_requests/101+) |"));
         assert!(table.contains("| #2 | `feature-2` | [Feat: part 2](https://gitlab.com/test/repo/-/merge_requests/102+) |"));
+    }
+
+    #[test]
+    fn test_build_stack_table_includes_all_branches() {
+        let (stack, mrs) = create_complex_test_stack_and_mrs();
+        let table = build_stack_table(&stack, &mrs);
+
+        assert!(table.contains(STACK_TABLE_START));
+        assert!(table.contains(STACK_TABLE_END));
+        
+        // Verify all branches are included in the table
+        assert!(table.contains("feature-1"), "Missing feature-1 in table: {}", table);
+        assert!(table.contains("feature-2"), "Missing feature-2 in table: {}", table);
+        assert!(table.contains("feature-3"), "Missing feature-3 in table: {}", table);
+        assert!(table.contains("feature-4"), "Missing feature-4 in table: {}", table);
+        
+        // Verify all MR links are included
+        assert!(table.contains("[Feat: part 1](https://gitlab.com/test/repo/-/merge_requests/101+)"));
+        assert!(table.contains("[Feat: part 2](https://gitlab.com/test/repo/-/merge_requests/102+)"));
+        assert!(table.contains("[Feat: part 3](https://gitlab.com/test/repo/-/merge_requests/103+)"));
+        assert!(table.contains("[Feat: part 4](https://gitlab.com/test/repo/-/merge_requests/104+)"));
+        
+        // Count the number of table rows (should be 4 branches + header rows)
+        let table_rows = table.lines().filter(|line| line.starts_with("|") && line.contains("#")).count();
+        assert_eq!(table_rows, 4, "Expected 4 branches in table, found {}: {}", table_rows, table);
     }
 
     #[test]
