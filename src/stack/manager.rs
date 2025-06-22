@@ -1330,31 +1330,27 @@ impl StackManager {
     }
 
     async fn create_mr_for_branch(&mut self, branch_name: &str, stack: &Stack) -> Result<()> {
-        if let Some(gitlab_client) = &self.gitlab_client {
-            if let Some(branch) = stack.branches.get(branch_name) {
-                let mut stack_mut = stack.clone();
-                self.create_or_update_mr_with_smart_targeting_and_store(
-                    gitlab_client.as_ref(),
-                    branch_name,
-                    branch,
-                    &mut stack_mut,
-                )
-                .await?;
+        if let Some(branch) = stack.branches.get(branch_name) {
+            let mut stack_mut = stack.clone();
+            self.create_or_update_mr_with_smart_targeting_and_store(
+                branch_name,
+                branch,
+                &mut stack_mut,
+            )
+            .await?;
 
-                // Save the updated stack
-                self.stack_state.save_stack(&stack_mut)?;
-                self.current_stack = Some(stack_mut);
+            // Save the updated stack
+            self.stack_state.save_stack(&stack_mut)?;
+            self.current_stack = Some(stack_mut);
 
-                print_success(&format!(
-                    "MR creation initiated for branch: {}",
-                    branch_name
-                ));
-            } else {
-                print_error(&format!("Branch '{}' not found in stack", branch_name));
-            }
+            print_success(&format!(
+                "MR creation initiated for branch: {}",
+                branch_name
+            ));
         } else {
-            print_error("GitLab client not available. Configure GitLab integration first.");
+            print_error(&format!("Branch '{}' not found in stack", branch_name));
         }
+
         Ok(())
     }
 
@@ -2013,13 +2009,12 @@ impl StackManager {
 
     /// Process all branches in the stack for MR creation/updates
     async fn process_all_branches_for_mrs(&self, stack: &mut Stack, success_message_prefix: &str) {
-        if let Some(gitlab_client) = &self.gitlab_client {
+        if self.gitlab_client.is_some() {
             let branches_to_process: Vec<(String, StackBranch)> =
                 stack.branches.clone().into_iter().collect();
             for (branch_name, branch) in branches_to_process {
                 match self
                     .create_or_update_mr_with_smart_targeting_and_store(
-                        gitlab_client.as_ref(),
                         &branch_name,
                         &branch,
                         stack,
@@ -2032,6 +2027,8 @@ impl StackManager {
                     }
                 }
             }
+        } else {
+            print_warning("GitLab client not available. Configure GitLab integration first.");
         }
     }
 
@@ -2041,14 +2038,13 @@ impl StackManager {
         stack: &mut Stack,
         success_message_prefix: &str,
     ) {
-        if let Some(gitlab_client) = &self.gitlab_client {
+        if self.gitlab_client.is_some() {
             let branches_to_process: Vec<(String, StackBranch)> =
                 stack.branches.clone().into_iter().collect();
             for (branch_name, branch) in branches_to_process {
                 if branch.mr_iid.is_some() {
                     match self
                         .create_or_update_mr_with_smart_targeting_and_store(
-                            gitlab_client.as_ref(),
                             &branch_name,
                             &branch,
                             stack,
@@ -2065,6 +2061,8 @@ impl StackManager {
                     }
                 }
             }
+        } else {
+            print_warning("GitLab client not available. Configure GitLab integration first.");
         }
     }
 
@@ -2150,12 +2148,7 @@ impl StackManager {
     ) {
         if let Some(children) = hierarchy.get(branch_name) {
             for child in children {
-                self.print_branch_details_with_status(
-                    child,
-                    stack,
-                    branch_mr_status,
-                    indent,
-                );
+                self.print_branch_details_with_status(child, stack, branch_mr_status, indent);
                 self.print_children_recursive_with_status(
                     hierarchy,
                     stack,
@@ -2218,7 +2211,9 @@ impl StackManager {
         }
 
         if mrs.len() != iids.len() {
-            print_warning("Could not fetch all merge requests, description update may be incomplete.");
+            print_warning(
+                "Could not fetch all merge requests, description update may be incomplete.",
+            );
         }
 
         // 3. Build the universal stack table
@@ -2226,8 +2221,7 @@ impl StackManager {
 
         // 4. Update all MRs concurrently
         let update_futures = mrs.values().map(|mr| {
-            let new_description =
-                markdown::update_description(&mr.description, &stack_table);
+            let new_description = markdown::update_description(&mr.description, &stack_table);
             gitlab.update_merge_request(mr.iid, None, Some(new_description))
         });
 
@@ -2304,7 +2298,9 @@ impl StackManager {
         if let Some(mr_iid) = branch.mr_iid {
             if let Ok(mr) = gitlab_client.get_merge_request(mr_iid).await {
                 // If the target branch is either in our stack or is the base branch, keep it
-                if stack.branches.contains_key(&mr.target_branch) || mr.target_branch == stack.base_branch {
+                if stack.branches.contains_key(&mr.target_branch)
+                    || mr.target_branch == stack.base_branch
+                {
                     print_info(&format!(
                         "Keeping existing MR target '{}' for branch '{}'",
                         mr.target_branch, branch_name
@@ -2358,17 +2354,16 @@ impl StackManager {
     /// Create or update merge request with intelligent target branch selection and store MR IID
     async fn create_or_update_mr_with_smart_targeting_and_store(
         &self,
-        gitlab_client: &(dyn GitLabApi + Send + Sync),
         branch_name: &str,
         branch: &StackBranch,
         stack: &mut Stack,
     ) -> Result<()> {
-        let gitlab_client =
-            self.gitlab_client
-                .as_ref()
-                .ok_or_else(|| TrainError::GitLabError {
-                    message: "GitLab client not available".to_string(),
-                })?;
+        let gitlab_client = self
+            .gitlab_client
+            .as_ref()
+            .ok_or_else(|| TrainError::GitLabError {
+                message: "GitLab client not available".to_string(),
+            })?;
 
         let target_branch = self
             .determine_optimal_target_branch(branch_name, stack, gitlab_client.as_ref())
@@ -2377,19 +2372,26 @@ impl StackManager {
         if let Some(mr_iid) = branch.mr_iid {
             // MR exists, fetch current state from GitLab to respect manual changes
             let current_mr = gitlab_client.get_merge_request(mr_iid).await?;
-            let current_commit_message = self.git_repo.get_commit_message_for_branch(branch_name)?;
+            let current_commit_message =
+                self.git_repo.get_commit_message_for_branch(branch_name)?;
             let expected_mr_title = format!("[Stack: {}] {}", stack.name, current_commit_message);
-            
+
             // Only update title if it's currently auto-generated (starts with [Stack: stack_name])
             // This preserves manually set titles on GitLab
-            let title_update = if current_mr.title.starts_with(&format!("[Stack: {}]", stack.name)) 
-                && current_mr.title != expected_mr_title {
+            let title_update = if current_mr
+                .title
+                .starts_with(&format!("[Stack: {}]", stack.name))
+                && current_mr.title != expected_mr_title
+            {
                 print_info(&format!(
                     "Updating auto-generated MR !{} title to reflect commit message change",
                     mr_iid
                 ));
                 Some(expected_mr_title.clone())
-            } else if !current_mr.title.starts_with(&format!("[Stack: {}]", stack.name)) {
+            } else if !current_mr
+                .title
+                .starts_with(&format!("[Stack: {}]", stack.name))
+            {
                 print_info(&format!(
                     "Preserving manually set title for MR !{}: '{}'",
                     mr_iid, current_mr.title
@@ -2398,7 +2400,7 @@ impl StackManager {
             } else {
                 None
             };
-            
+
             print_info(&format!(
                 "Updating MR !{} for branch '{}' to target '{}'",
                 mr_iid, branch_name, target_branch
@@ -2406,13 +2408,13 @@ impl StackManager {
             let updated_mr = gitlab_client
                 .update_merge_request_with_target(mr_iid, title_update, None, Some(target_branch))
                 .await?;
-            
+
             // Update stored title in stack to reflect current GitLab state
             if let Some(b) = stack.branches.get_mut(branch_name) {
                 b.mr_title = Some(updated_mr.title.clone());
                 b.updated_at = Utc::now();
             }
-            
+
             print_success(&format!("Updated MR: {}", updated_mr.web_url));
         } else {
             // MR does not exist, create it

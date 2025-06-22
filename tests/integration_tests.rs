@@ -14,11 +14,11 @@ use gittrain::config::AutoResolveStrategy;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-use tokio::sync::RwLock;
 
 // A helper struct for managing a temporary git repository for tests
 struct TestRepo {
     dir: TempDir,
+    #[allow(dead_code)] // Needed to keep the remote directory alive
     remote_dir: TempDir,
     repo: GitRepository,
 }
@@ -106,7 +106,6 @@ impl TestRepo {
 #[derive(Clone)]
 struct MockGitLab {
     project: GitLabProject,
-    project_details: Arc<RwLock<Option<GitLabProject>>>,
     merge_requests: Arc<Mutex<HashMap<u64, MergeRequest>>>,
     next_mr_iid: Arc<Mutex<u64>>,
 }
@@ -130,7 +129,6 @@ impl MockGitLab {
         };
         Self {
             project: project.clone(),
-            project_details: Arc::new(RwLock::new(Some(project))),
             merge_requests: Arc::new(Mutex::new(HashMap::new())),
             next_mr_iid: Arc::new(Mutex::new(1)),
         }
