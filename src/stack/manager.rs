@@ -1400,8 +1400,19 @@ impl StackManager {
         let mut push_failures = Vec::new();
         let mut successful_pushes = Vec::new();
 
+        let branch_mr_status = self.collect_mr_status_info(&stack).await;
+
         // Push all branches in the stack
         for branch_name in stack.branches.keys() {
+            if let Some(status) = branch_mr_status.get(branch_name) {
+                if status.state == "merged" {
+                    print_info(&format!(
+                        "Skipping push for branch '{}' as its MR !{} is already merged.",
+                        branch_name, status.iid
+                    ));
+                    continue;
+                }
+            }
             print_info(&format!("Pushing branch: {}", branch_name));
 
             // First try a normal push

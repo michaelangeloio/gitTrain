@@ -18,12 +18,12 @@ pub fn build_stack_table(stack: &Stack, mrs: &HashMap<u64, MergeRequest>) -> Str
     let branches_in_order = collect_branches_in_order(stack);
 
     for (i, branch) in branches_in_order.iter().enumerate() {
-        let position = format!("#{}", i + 1);
+        let position = format!("{}", i + 1);
 
         let mr_link = if let Some(iid) = branch.mr_iid {
             if let Some(mr) = mrs.get(&iid) {
                 // Append '+' to the URL to get a rich link in GitLab
-                format!("[{}]({}+)", mr.title, mr.web_url)
+                format!("{}+", mr.web_url)
             } else {
                 "N/A (MR not found)".to_string()
             }
